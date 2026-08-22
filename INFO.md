@@ -20,9 +20,8 @@ Runs before anything touches the system.
    0600, falling back to a temporary file if `/var/log` is not writable.
 
 The console and the log are separate streams from this point on. File
-descriptor 3 is the terminal; command output goes to the log. This is what
-allows the generated private key to be shown on screen without ever being
-written to disk.
+descriptor 3 is the terminal; command output goes to the log, so a run reads as
+a list of outcomes rather than a wall of apt and docker chatter.
 
 ---
 
@@ -66,8 +65,17 @@ The step counter reflects only the components that will actually run, so
   a `127.0.1.1` entry to `/etc/hosts` so that `sudo` does not stall on name
   resolution.
 - Refreshes the apt indexes.
-- Counts pending upgrades with `apt-get -s upgrade` and runs `dist-upgrade` only
-  if there are any.
+- Runs `apt-get dist-upgrade` with
+  `-o APT::Get::Always-Include-Phased-Updates=true`. Ubuntu releases some
+  updates to a fraction of machines at a time; a host being deliberately
+  brought up to date should not be held back by the rollout cohort. The option
+  does nothing on Debian, which does not phase updates.
+- The upgrade runs unconditionally. The pending count shown alongside it comes
+  from `apt-get -s dist-upgrade` — the same command that then runs for real —
+  and is reporting only, never a gate. An earlier version counted with
+  `apt-get -s upgrade` and ran `dist-upgrade`, which meant a host whose only
+  pending work was a new kernel simulated zero packages, printed "System
+  already up to date", and skipped the upgrade entirely.
 - Runs `autoremove`.
 - Warns if `/var/run/reboot-required` exists.
 
@@ -87,44 +95,48 @@ If the apt indexes have not been refreshed yet in this run — which happens whe
 `update` was excluded or `--only=base` was used — this step refreshes them
 first.
 
-### 3. `ssh` — Account, keys, and hardening
+### 3. `ssh` — Account, key, and port
 
-The ordering inside this step is what makes a lockout impossible.
+This step used to harden sshd. It no longer does, and that is the point: every
+authentication directive worth setting is one that can also refuse a login, and
+an unattended first-boot run has nobody at the console to notice. `Port` is the
+only directive still written, because it cannot deny a login by itself and the
+firewall step has to agree with it.
 
 1. **Create the account.** With the default `--username=root` nothing is
    created. Otherwise the user is created if missing, added to the `sudo` group,
    and given a validated passwordless sudoers drop-in. No password is ever set,
    so login is key-only; passwordless sudo is therefore required for the account
    to administer anything.
-2. **Install keys.** In priority order: install `--pubkey` if given; otherwise
-   keep the existing authorized keys if there are any and `--new-key` was not
-   passed; otherwise generate an ed25519 keypair, install the public half, and
-   print the private half to the console. The private key is shredded from its
-   temporary directory immediately after being read, and is written to a file
-   only when `--save-key` is given.
-3. **Verify.** The script counts the entries in `authorized_keys`. If there are
-   none, it refuses to harden sshd and exits.
-4. **Ensure the include.** Adds `Include /etc/ssh/sshd_config.d/*.conf` to the
+2. **Install a key.** Append-only. `--pubkey` is added to `authorized_keys` if
+   given and not already present; otherwise whatever the account already has is
+   left alone. The script generates nothing, and removes nothing. An account
+   with no keys is not an error — password authentication is whatever the image
+   configured, and this script does not change it.
+3. **Ensure the include.** Adds `Include /etc/ssh/sshd_config.d/*.conf` to the
    top of `/etc/ssh/sshd_config` if it is missing, as on Debian 11.
-5. **Neutralise conflicts.** Comments out the directives the script owns
-   wherever else they are set, in the main config and in every other drop-in.
-   sshd keeps the first value it finds, so a cloud image's
-   `50-cloud-init.conf` would otherwise silently win. Every edited file is
-   backed up as `<file>.bak-<timestamp>`.
-6. **Write the drop-in.** `/etc/ssh/sshd_config.d/00-server-init.conf`. The
-   `00-` prefix guarantees it is read first. Key exchange, cipher and MAC lists
-   are intersected with `ssh -Q` output so no unsupported algorithm is ever
-   written.
-7. **Prune weak moduli.** Removes Diffie-Hellman moduli below 3072 bits from
-   `/etc/ssh/moduli`.
-8. **Validate.** Runs `sshd -t`. On failure the baseline is tested too: if the
+4. **Neutralise conflicting `Port` lines.** Comments out `Port` wherever else it
+   is set, in the main config and in every other drop-in, since sshd keeps the
+   first value it finds and a cloud image's `50-cloud-init.conf` would otherwise
+   win. `Port` is the only directive touched; everything else in those files is
+   left exactly as it is. Every edited file is backed up as
+   `<file>.bak-<timestamp>`.
+5. **Write the drop-in.** `/etc/ssh/sshd_config.d/00-server-init.conf`, whose
+   entire managed content is one line:
+
+   ```
+   Port <n>
+   ```
+
+   The `00-` prefix guarantees it is read first.
+6. **Validate.** Runs `sshd -t`. On failure the baseline is tested too: if the
    baseline passes, the drop-in is the culprit and is removed, leaving SSH
    untouched, and the run stops. If the baseline also fails, the problem
-   pre-dates this script, so the hardening is kept and the real error is
+   pre-dates this script, so the drop-in is kept and the real error is
    reported as a warning.
-9. **Apply the port.** On socket-activated systems (Ubuntu 24.04, Debian 13) the
+7. **Apply the port.** On socket-activated systems (Ubuntu 24.04, Debian 13) the
    `Port` directive is ignored, so a `ssh.socket` drop-in is written instead.
-10. **Restart sshd** and confirm it is active.
+8. **Restart sshd** and confirm it is active.
 
 Existing SSH sessions survive the restart, which is why the summary insists on
 verifying a new login before disconnecting.
@@ -240,11 +252,10 @@ The configuration is then validated with `unattended-upgrade --dry-run`.
 Collects the public IP, then prints:
 
 - installed versions of Docker, Dokploy, cloudflared, fail2ban and Bun
-- the SSH account, port, key source, and whether password authentication is on
+- the SSH account, port, and key source
 - the SSH and Dokploy URLs
 - every warning raised during the run, collected in one place
 - the numbered manual steps that remain
-- a reminder to copy the private key, if one was generated
 
 ---
 

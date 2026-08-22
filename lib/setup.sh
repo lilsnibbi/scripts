@@ -2,9 +2,12 @@
 # =============================================================================
 #  setup.sh - Server Initialization Suite
 #
-#  Bootstraps a fresh Debian or Ubuntu VM: system updates, SSH key setup and
-#  hardening, firewall, fail2ban, Docker, Dokploy, and unattended security
-#  updates.
+#  Bootstraps a fresh Debian or Ubuntu VM: system updates, the login account,
+#  firewall, fail2ban, Docker, Dokploy, and unattended security updates.
+#
+#  It deliberately does NOT harden sshd. The only sshd setting it writes is
+#  Port, and it generates no keys. Rewriting authentication from an unattended
+#  script is how a host ends up unreachable with nobody watching the console.
 #
 #  Designed to run unattended on first boot. Every step is idempotent and safe
 #  to re-run.
@@ -42,9 +45,6 @@ APT_OPTS=(
 OPT_USERNAME="root"
 OPT_SSH_PORT="22"
 OPT_PUBKEY=""
-OPT_NEW_KEY=0
-OPT_SAVE_KEY=""
-OPT_KEEP_PASSWORD_AUTH=0
 OPT_HOSTNAME=""
 # UTC by default rather than whatever the image happens to ship. Timestamps
 # from a fleet are only comparable if every host agrees on the zone, and a
@@ -66,9 +66,9 @@ OPT_NO_COLOR=0
 # Components, in execution order. "name:description".
 # -----------------------------------------------------------------------------
 COMPONENTS=(
-  "update:Refresh apt indexes and apply pending security upgrades"
+  "update:Refresh apt indexes and apply every pending upgrade"
   "base:Install base utilities (curl, git, jq, iproute2, ...)"
-  "ssh:Create the login account, install SSH keys, harden sshd"
+  "ssh:Create the login account and set the SSH port"
   "firewall:Configure the UFW firewall"
   "fail2ban:Install and pre-configure fail2ban for SSH"
   "hardening:Kernel network hardening, journald limits, root password lock"
@@ -78,7 +78,7 @@ COMPONENTS=(
   "cloudflared:Install the Cloudflare Zero Trust tunnel daemon"
   "bun:Install the Bun JavaScript runtime"
   "unattended:Enable automatic security updates"
-  "verify:Prove SSH still works before this session is closed"
+  "verify:Check sshd, the firewall and the login account"
 )
 
 # -----------------------------------------------------------------------------
@@ -92,9 +92,7 @@ STEP_TOTAL=0
 TTY=0
 START_TIME=$SECONDS
 
-GENERATED_PRIVATE_KEY=""
 SSH_KEY_SOURCE="none"
-SSH_HARDENED=0
 DOKPLOY_INSTALLED=0
 
 declare -a WARNINGS=()
@@ -112,7 +110,7 @@ PUBLIC_IP=""
 # NO_COLOR is set, or via --no-color.
 # -----------------------------------------------------------------------------
 NC='' BOLD='' DIM=''
-C_TITLE='' C_STEP='' C_OK='' C_WARN='' C_ERR='' C_INFO='' C_MUTED='' C_RULE='' C_KEY='' C_BADGE=''
+C_TITLE='' C_STEP='' C_OK='' C_WARN='' C_ERR='' C_INFO='' C_MUTED='' C_RULE='' C_BADGE=''
 
 # How many colours the terminal can actually show. Emitting 256-colour codes at
 # a 16-colour serial console prints the escape sequence as literal text, which
@@ -154,41 +152,38 @@ setup_colors() {
   case "$depth" in
     3)
       C_TITLE=$'\033[38;2;255;255;255m'   # white     - headings, the loudest thing
-      C_STEP=$'\033[38;2;199;125;255m'    # violet    - step badges, product name
+      C_STEP=$'\033[38;2;0;255;255m'      # cyan      - step badges, product name
       C_INFO=$'\033[38;2;43;231;255m'     # cyan      - in-progress, addresses
       C_OK=$'\033[38;2;61;255;136m'       # spring    - completed
       C_WARN=$'\033[38;2;255;182;39m'     # amber     - warnings
       C_ERR=$'\033[38;2;255;77;109m'      # rose      - failures
       C_MUTED=$'\033[38;2;163;177;209m'   # pale slate- secondary detail
       C_RULE=$'\033[38;2;76;90;135m'      # slate     - dividers and frames
-      C_KEY=$'\033[38;2;255;210;74m'      # gold      - the private key callout
-      # A filled chip: violet background, near-black text. Legible on a light
+      # A filled chip: cyan background, near-black text. Legible on a light
       # terminal as well as a dark one, because both halves are set here.
-      C_BADGE=$'\033[48;2;199;125;255;38;2;22;18;32;1m'
+      C_BADGE=$'\033[48;2;0;255;255;38;2;10;26;30;1m'
       ;;
     2)
       C_TITLE=$'\033[38;5;231m'
-      C_STEP=$'\033[38;5;141m'
+      C_STEP=$'\033[38;5;51m'
       C_INFO=$'\033[38;5;51m'
       C_OK=$'\033[38;5;48m'
       C_WARN=$'\033[38;5;214m'
       C_ERR=$'\033[38;5;203m'
       C_MUTED=$'\033[38;5;250m'
       C_RULE=$'\033[38;5;60m'
-      C_KEY=$'\033[38;5;220m'
-      C_BADGE=$'\033[48;5;141;38;5;16;1m'
+      C_BADGE=$'\033[48;5;51;38;5;16;1m'
       ;;
     *)
       C_TITLE=$'\033[97m'
-      C_STEP=$'\033[95m'
+      C_STEP=$'\033[96m'
       C_INFO=$'\033[96m'
       C_OK=$'\033[92m'
       C_WARN=$'\033[93m'
       C_ERR=$'\033[91m'
       C_MUTED=$'\033[37m'
       C_RULE=$'\033[90m'
-      C_KEY=$'\033[93m'
-      C_BADGE=$'\033[45;30;1m'
+      C_BADGE=$'\033[46;30;1m'
       ;;
   esac
 }
@@ -241,9 +236,9 @@ detect_width() {
 # -----------------------------------------------------------------------------
 # Logging and console output.
 #
-# The console (fd 3) and the log file are deliberately separate streams. Command
-# output goes only to the log; the generated private key goes only to the
-# console, so it is never written to disk.
+# The console (fd 3) and the log file are deliberately separate streams: command
+# output goes only to the log, so a run reads as a list of outcomes rather than
+# a wall of apt and docker chatter.
 # -----------------------------------------------------------------------------
 strip_ansi() { printf '%s' "$1" | sed -e 's/\x1b\[[0-9;]*m//g'; }
 
@@ -259,7 +254,7 @@ say() {
   log "[ui] $(strip_ansi "$*")"
 }
 
-info()   { say "   ${C_INFO}${BOLD}·${NC} $*"; }
+info()   { say "   ${C_INFO}${BOLD}›${NC} $*"; }
 # Wraps, but only when it has to. Several callers pass deliberately indented
 # text - a command to copy, say - and running that through the wrapper
 # unconditionally would eat the indent it was given for a reason.
@@ -440,10 +435,6 @@ on_error() {
   fi
   ui ""
   ui "    Full log: ${BOLD}${LOG_FILE}${NC}"
-  # A key generated before the failure is already installed on the server and
-  # exists nowhere but this screen. Losing it to an unrelated later failure
-  # would lock the account out for good.
-  print_private_key
   ui ""
   exit "$rc"
 }
@@ -646,14 +637,13 @@ usage() {
   ui ""
   ui " ${C_TITLE}${BOLD}Account and SSH${NC}"
   ui "   ${C_INFO}--username=NAME${NC}      Login account to configure. Default: ${BOLD}root${NC}."
-  ui "                        A non-root name is created with passwordless sudo,"
-  ui "                        and root SSH login is then disabled."
-  ui "   ${C_INFO}--ssh-port=N${NC}         Port for sshd. Default: ${BOLD}22${NC}."
-  ui "   ${C_INFO}--pubkey=\"ssh-... \"${NC}  Install this public key instead of generating one."
-  ui "   ${C_INFO}--new-key${NC}            Generate a fresh keypair even if the account already"
-  ui "                        has authorized keys."
-  ui "   ${C_INFO}--save-key=PATH${NC}      Also write the generated private key to PATH (mode 0600)."
-  ui "   ${C_INFO}--keep-password-auth${NC} Leave SSH password login enabled. Not recommended."
+  ui "                        A non-root name is created with passwordless sudo."
+  ui "                        Root SSH login is left as the system had it."
+  ui "   ${C_INFO}--ssh-port=N${NC}         Port for sshd, and the port opened in the firewall."
+  ui "                        Default: ${BOLD}22${NC}. This is the ${BOLD}only${NC} sshd setting the"
+  ui "                        script writes; authentication is left alone."
+  ui "   ${C_INFO}--pubkey=\"ssh-... \"${NC}  Append this public key to the account's authorized_keys."
+  ui "                        Optional. Existing keys are never removed."
   ui ""
   ui " ${C_TITLE}${BOLD}System${NC}"
   ui "   ${C_INFO}--hostname=NAME${NC}      Set the system hostname."
@@ -686,7 +676,7 @@ usage() {
   ui "   ${C_INFO}--help${NC}               Show this help and exit."
   ui ""
   ui " ${C_TITLE}${BOLD}Examples${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh${NC}"
+  ui "   ${C_MUTED}sudo ./setup.sh --pubkey=\"\$(cat ~/.ssh/id_ed25519.pub)\"${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --username=deploy --ssh-port=2222 --ui-allow=203.0.113.9/32${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --exclude=bun,cloudflared${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --only=ssh,firewall,fail2ban${NC}"
@@ -726,9 +716,6 @@ parse_args() {
       --username=*)          OPT_USERNAME="$value" ;;
       --ssh-port=*)          OPT_SSH_PORT="$value" ;;
       --pubkey=*)            OPT_PUBKEY="$value" ;;
-      --new-key)             OPT_NEW_KEY=1 ;;
-      --save-key=*)          OPT_SAVE_KEY="$value" ;;
-      --keep-password-auth)  OPT_KEEP_PASSWORD_AUTH=1 ;;
       --hostname=*)          OPT_HOSTNAME="$value" ;;
       --timezone=*)          OPT_TIMEZONE="$value"; OPT_TIMEZONE_SET=1 ;;
       --ui-allow=*)          OPT_UI_ALLOW="$value" ;;
@@ -1010,13 +997,32 @@ fn_update() {
 
   apt_update || die "apt-get update failed. Check network and mirror configuration."
 
+  # Ubuntu ships some updates to a percentage of machines at a time and holds
+  # them back everywhere else. On a host being deliberately brought fully up to
+  # date, "not in the rollout cohort yet" is not a useful reason to skip a
+  # package, so opt in to the phased ones too. Inert on Debian, which does not
+  # phase updates at all.
+  local upgrade_opts=("${APT_OPTS[@]}" -o APT::Get::Always-Include-Phased-Updates=true)
+
+  # Simulate the command that actually runs. "apt-get upgrade" never installs
+  # or removes a package, so on any host with a pending kernel or a changed
+  # dependency it simulates zero work while dist-upgrade has plenty. Counting
+  # with one and running the other is how this step used to report "already up
+  # to date" and skip the upgrade on precisely the machines that needed it.
   local pending
-  pending="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ' || true)"
+  pending="$(apt-get -s dist-upgrade "${upgrade_opts[@]}" 2>/dev/null | grep -c '^Inst ' || true)"
   if [ "${pending:-0}" -gt 0 ]; then
     detail "$pending package(s) to upgrade"
-    run_spin "Upgrading packages (this can take several minutes)" \
-      retry apt-get dist-upgrade "${APT_OPTS[@]}" \
-      || die "Package upgrade failed. See $LOG_FILE"
+  fi
+
+  # Run it whatever the count says. The simulation is a report, not a gate: it
+  # can still disagree with the real resolver, and a dist-upgrade with nothing
+  # to do costs about a second.
+  run_spin "Upgrading packages (this can take several minutes)" \
+    retry apt-get dist-upgrade "${upgrade_opts[@]}" \
+    || die "Package upgrade failed. See $LOG_FILE"
+
+  if [ "${pending:-0}" -gt 0 ]; then
     ok "System packages upgraded"
   else
     ok "System already up to date"
@@ -1055,9 +1061,13 @@ fn_base() {
 # =============================================================================
 # Component: ssh
 #
-# Order matters. The account and its authorized_keys are created and verified
-# first; sshd is only hardened afterwards, and never if no usable key is in
-# place. That ordering is what makes a lockout impossible.
+# Scope is deliberately narrow: create the login account, append a public key
+# if one was supplied, and set the listening port. Authentication directives -
+# PasswordAuthentication, PermitRootLogin, AllowUsers, AuthenticationMethods -
+# are never written, because getting any of them wrong on an unattended run
+# locks the host out with nobody at the console to undo it. Port is the one
+# exception: it cannot deny a login on its own, and the firewall step needs to
+# agree with it.
 # =============================================================================
 SSH_USER_HOME=""
 
@@ -1142,82 +1152,9 @@ ssh_install_pubkey() {
   fi
 }
 
-# The private key is printed to the console only, never to the log file, and is
-# shredded from the temporary directory immediately after being read.
-ssh_generate_key() {
-  local tmpdir comment priv pub
-  comment="${OPT_USERNAME}@$(hostname)-$(date +%Y%m%d)"
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would generate an ed25519 keypair ($comment)"
-    SSH_KEY_SOURCE="generated"
-    return 0
-  fi
-
-  tmpdir="$(mktemp -d)"
-  chmod 700 "$tmpdir"
-  ssh-keygen -t ed25519 -a 100 -N '' -C "$comment" -f "$tmpdir/id_ed25519" >>"$LOG_FILE" 2>&1 \
-    || die "ssh-keygen failed."
-
-  priv="$(cat "$tmpdir/id_ed25519")"
-  pub="$(cat "$tmpdir/id_ed25519.pub")"
-
-  if have shred; then
-    shred -u "$tmpdir/id_ed25519" "$tmpdir/id_ed25519.pub" 2>/dev/null || true
-  fi
-  rm -rf "$tmpdir"
-
-  ssh_install_pubkey "$pub"
-  GENERATED_PRIVATE_KEY="$priv"
-  SSH_KEY_SOURCE="generated"
-
-  if [ -n "$OPT_SAVE_KEY" ]; then
-    ( umask 077; printf '%s\n' "$priv" >"$OPT_SAVE_KEY" )
-    chmod 600 "$OPT_SAVE_KEY"
-    warn "Private key also written to $OPT_SAVE_KEY — delete it once copied."
-  fi
-
-  detail "Private key held for printing at the end of this run"
-}
-
-# Prints the generated private key and what to do with it. Deliberately called
-# at the very end of a run - and from the error handler - rather than at the
-# moment the key is created: on a full run that moment is eight steps and
-# several screens of scrollback before the prompt comes back.
-#
-# The key body is printed flush left and without decoration on its own lines.
-# Anything else - an indent, a leading "│" - is copied along with the key and
-# makes the resulting file unreadable to ssh, which is the whole point of
-# printing it.
-#
-# No argument: the key comes from GENERATED_PRIVATE_KEY, and the function is a
-# no-op when no key was generated (--pubkey, or an account that already had
-# authorized keys).
-print_private_key() {
-  [ -n "$GENERATED_PRIVATE_KEY" ] || return 0
-
-  local title=" PRIVATE KEY - copy it now, it is stored nowhere else "
-  local host="${PUBLIC_IP:-<server-ip>}"
-  local width=0 line
-
-  while IFS= read -r line; do
-    [ "${#line}" -gt "$width" ] && width="${#line}"
-  done <<<"$GENERATED_PRIVATE_KEY"
-  [ "$width" -ge $((${#title} + 2)) ] || width=$((${#title} + 2))
-
-  local kf="~/.ssh/${OPT_USERNAME}_key"
-  ui ""
-  ui "${C_KEY}${BOLD}┏━${title}$(rule_heavy $((width - ${#title} - 1)))┓${NC}"
-  printf '%s\n' "$GENERATED_PRIVATE_KEY" >&3
-  ui "${C_KEY}${BOLD}┗$(rule_heavy "$width")┛${NC}"
-  ui ""
-  ui "   ${C_STEP}${BOLD}1${NC}  Save the block above, BEGIN and END lines included, as ${C_INFO}${kf}${NC}"
-  ui "   ${C_STEP}${BOLD}2${NC}  ${C_INFO}chmod 600 ${kf}${NC}"
-  ui "   ${C_STEP}${BOLD}3${NC}  ${C_INFO}ssh -i ${kf} -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${host}${NC}"
-  ui "      ${C_MUTED}Do that from a second terminal, before you close this one.${NC}"
-  log "[ui] (private key printed to console; deliberately not logged)"
-}
-
+# Appends a supplied public key, or leaves whatever is already there alone.
+# Nothing here can remove an existing key or refuse a login, so there is no
+# failure mode that costs access.
 ssh_setup_keys() {
   local existing
   existing="$(ssh_count_keys)"
@@ -1229,42 +1166,24 @@ ssh_setup_keys() {
     return 0
   fi
 
-  if [ "$existing" -gt 0 ] && [ "$OPT_NEW_KEY" -eq 0 ]; then
+  if [ "$existing" -gt 0 ]; then
     SSH_KEY_SOURCE="existing"
     ok "'$OPT_USERNAME' already has $existing authorized key(s); keeping them"
-    detail "Use --new-key to generate an additional keypair anyway"
     return 0
   fi
 
-  info "Generating a new ed25519 keypair for '$OPT_USERNAME'"
-  ssh_generate_key
-  ok "Public key installed in $(ssh_authorized_keys_path)"
+  SSH_KEY_SOURCE="none"
+  detail "No authorized keys for '$OPT_USERNAME' and no --pubkey given; leaving authentication as it is"
+  return 0
 }
 
-# Build an algorithm list from a desired set intersected with what this sshd
-# actually supports. Listing an algorithm the local OpenSSH does not know makes
-# sshd -t fail, which would abort hardening on older releases.
-ssh_supported_algos() {
-  local query="$1" desired="$2" avail out=""
-  avail="$(ssh -Q "$query" 2>/dev/null || true)"
-  [ -n "$avail" ] || return 1
-  local a
-  for a in ${desired//,/ }; do
-    if printf '%s\n' "$avail" | grep -qxF "$a"; then
-      out="${out:+$out,}$a"
-    fi
-  done
-  [ -n "$out" ] || return 1
-  printf '%s' "$out"
-}
-
-# Comment out directives we own wherever else they are set, so the effective
-# configuration is unambiguous. sshd uses the first value it finds, so cloud
-# images that ship /etc/ssh/sshd_config.d/50-cloud-init.conf with
-# "PasswordAuthentication yes" would otherwise silently win.
+# Port is the only directive this script owns, and it is the only one commented
+# out elsewhere. sshd keeps the first value it finds, so a cloud image shipping
+# /etc/ssh/sshd_config.d/50-cloud-init.conf with its own Port would otherwise
+# silently win. Every other directive in those files is left exactly as it is.
 ssh_neutralise_conflicts() {
   local ours="$1"
-  local directives='PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|PermitEmptyPasswords|KbdInteractiveAuthentication|ChallengeResponseAuthentication|X11Forwarding|MaxAuthTries|ClientAliveInterval|ClientAliveCountMax|LoginGraceTime|AllowUsers|AllowGroups|Port'
+  local directives='Port'
   local f
   for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
     [ -f "$f" ] || continue
@@ -1359,99 +1278,36 @@ validate_sshd_config() {
 }
 
 fn_ssh() {
-  step "SSH access and hardening"
+  step "SSH access"
 
   ssh_create_user
   ssh_setup_keys
-
-  local keycount
-  keycount="$(ssh_count_keys)"
-  if [ "$OPT_DRY_RUN" -eq 0 ] && [ "$keycount" -lt 1 ]; then
-    die "No authorized keys are installed for '$OPT_USERNAME'. Refusing to harden sshd; that would lock you out."
-  fi
 
   local ours=/etc/ssh/sshd_config.d/00-server-init.conf
   ssh_ensure_include
   ssh_neutralise_conflicts "$ours"
 
-  local root_login="prohibit-password"
-  local allow_line="AllowUsers $OPT_USERNAME"
-  if [ "$OPT_USERNAME" != "root" ]; then
-    root_login="no"
-  fi
-
-  local password_auth="no"
-  if [ "$OPT_KEEP_PASSWORD_AUTH" -eq 1 ]; then
-    password_auth="yes"
-    warn "Password authentication left enabled by --keep-password-auth."
-  fi
-
-  local kex ciphers macs crypto=""
-  kex="$(ssh_supported_algos kex 'sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group18-sha512,diffie-hellman-group16-sha512' || true)"
-  ciphers="$(ssh_supported_algos cipher 'chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr' || true)"
-  macs="$(ssh_supported_algos mac 'hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com' || true)"
-  [ -n "$kex" ]     && crypto="${crypto}KexAlgorithms $kex"$'\n'
-  [ -n "$ciphers" ] && crypto="${crypto}Ciphers $ciphers"$'\n'
-  [ -n "$macs" ]    && crypto="${crypto}MACs $macs"$'\n'
-
+  # One directive. Everything this file used to set - PermitRootLogin,
+  # PasswordAuthentication, AllowUsers, AuthenticationMethods, MaxAuthTries,
+  # the KexAlgorithms/Ciphers/MACs lists - is gone on purpose. Any of them can
+  # refuse a login, and an unattended run has nobody to notice.
   local content
   content="$(cat <<CONF
 # Managed by setup.sh (Server Initialization Suite) — do not edit by hand.
 # Generated $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 #
 # This file sorts first inside sshd_config.d on purpose: sshd keeps the first
-# value it sees for a directive, so nothing later can weaken these settings.
+# value it sees for a directive, so nothing later can move the port back.
+#
+# Port is the only setting managed here. Authentication is left to the system's
+# own configuration.
 
 Port $OPT_SSH_PORT
-
-# Authentication
-PermitRootLogin $root_login
-PasswordAuthentication $password_auth
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-AuthenticationMethods publickey
-UsePAM yes
-$allow_line
-
-# Brute-force surface
-MaxAuthTries 3
-MaxSessions 10
-LoginGraceTime 30
-MaxStartups 10:30:60
-
-# Idle session cleanup
-ClientAliveInterval 300
-ClientAliveCountMax 2
-
-# Reduce what a session can reach
-X11Forwarding no
-AllowAgentForwarding no
-PermitUserEnvironment no
-
-${crypto}
 CONF
 )"
 
-  if [ "$OPT_KEEP_PASSWORD_AUTH" -eq 1 ]; then
-    # A comma-separated AuthenticationMethods list requires *every* method it
-    # lists, so it cannot express "either one". Remove the directive and let
-    # PasswordAuthentication and PubkeyAuthentication decide on their own.
-    content="$(grep -v '^AuthenticationMethods ' <<< "$content")"
-  fi
-
   backup_file "$ours"
   write_file "$ours" 0644 "$content" || true
-
-  # Weak Diffie-Hellman moduli are a standard hardening step and are safe to
-  # drop as long as some remain.
-  if [ -f /etc/ssh/moduli ] && [ "$OPT_DRY_RUN" -eq 0 ]; then
-    if awk '$5 >= 3071' /etc/ssh/moduli >/tmp/moduli.safe 2>/dev/null && [ -s /tmp/moduli.safe ]; then
-      run cp /tmp/moduli.safe /etc/ssh/moduli
-      detail "Removed Diffie-Hellman moduli below 3072 bits"
-    fi
-    rm -f /tmp/moduli.safe
-  fi
 
   if [ "$OPT_DRY_RUN" -eq 0 ]; then
     # sshd -t needs the privilege separation directory, which normally only
@@ -1463,14 +1319,10 @@ CONF
   ssh_apply_socket_port
   ssh_restart
 
-  SSH_HARDENED=1
-  ok "sshd hardened on port $OPT_SSH_PORT (login: $OPT_USERNAME, password auth: $password_auth)"
+  ok "sshd listening on port $OPT_SSH_PORT (authentication left unchanged)"
 
   if [ "$OPT_SSH_PORT" != "22" ]; then
     warn "SSH now listens on port $OPT_SSH_PORT. Verify a new session works before closing this one."
-  fi
-  if [ "$OPT_USERNAME" != "root" ]; then
-    warn "Root SSH login is disabled. Log in as '$OPT_USERNAME' and use sudo."
   fi
 }
 
@@ -2249,7 +2101,7 @@ fn_verify() {
   step "Verify access"
 
   if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would verify sshd, the firewall and a real key login"
+    detail "Would verify sshd, the firewall and the account's authorized_keys"
     return 0
   fi
 
@@ -2265,44 +2117,36 @@ fn_verify() {
     detail "UFW not active"
   fi
 
-  verify_key_login
+  verify_authorized_keys
 }
 
-# Prove the generated key actually authenticates, by using it. A key that was
-# written to the wrong path, into a home directory with the wrong ownership, or
-# under an AllowUsers line that excludes the account, all look identical to a
-# successful run until the operator disconnects.
-verify_key_login() {
-  if [ -z "$GENERATED_PRIVATE_KEY" ]; then
-    detail "No generated key to test; skipping the login check"
+# Reports on authorized_keys without judging it. Password authentication is
+# whatever the system already had, so an empty file is not necessarily a
+# problem - but a key file sshd will silently ignore, because the ownership or
+# mode is wrong, is worth saying out loud.
+verify_authorized_keys() {
+  local f perm owner
+
+  if [ -z "$SSH_USER_HOME" ]; then
+    detail "Home directory for '$OPT_USERNAME' is unknown; skipping the key check"
     return 0
   fi
-  if ! have ssh; then
-    detail "No ssh client available; skipping the login check"
+  f="$(ssh_authorized_keys_path)"
+
+  if [ ! -s "$f" ]; then
+    detail "No authorized_keys for '$OPT_USERNAME'; sshd falls back to whatever it was already configured to accept"
     return 0
   fi
 
-  local tmpdir kf rc=0
-  tmpdir="$(mktemp -d)"
-  chmod 700 "$tmpdir"
-  kf="$tmpdir/key"
-  ( umask 077; printf '%s\n' "$GENERATED_PRIVATE_KEY" >"$kf" )
+  owner="$(stat -c '%U' "$f" 2>/dev/null || true)"
+  perm="$(stat -c '%a' "$f" 2>/dev/null || true)"
 
-  # Loopback only: it exercises sshd's real configuration without depending on
-  # the host being reachable from outside, and 127.0.0.1 is in fail2ban's
-  # ignoreip so a failed attempt cannot ban the machine from itself.
-  run_sh "ssh -i '$kf' -p '$OPT_SSH_PORT' \
-    -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout=10 -o LogLevel=ERROR \
-    '${OPT_USERNAME}@127.0.0.1' true" || rc=$?
-
-  have shred && shred -u "$kf" 2>/dev/null || true
-  rm -rf "$tmpdir"
-
-  if [ $rc -eq 0 ]; then
-    ok "The generated key authenticates as '$OPT_USERNAME'"
+  if [ -n "$owner" ] && [ "$owner" != "$OPT_USERNAME" ]; then
+    warn "$f is owned by '$owner', not '$OPT_USERNAME'; sshd will ignore it."
+  elif [ -n "$perm" ] && [ "$perm" != "600" ] && [ "$perm" != "400" ]; then
+    warn "$f is mode $perm; sshd may refuse to read it. Expected 600."
   else
-    warn "The generated key did not authenticate over loopback. Keep this session open and check 'journalctl -u ssh'."
+    ok "$(ssh_count_keys) authorized key(s) in place for '$OPT_USERNAME'"
   fi
   return 0
 }
@@ -2357,10 +2201,6 @@ summary() {
     fi
   fi
   row "Log" "$C_MUTED" "$LOG_FILE"
-
-  # Last of all, so the key and its instructions are still on screen when the
-  # run ends and nothing has to be scrolled back for.
-  print_private_key
   ui ""
 }
 

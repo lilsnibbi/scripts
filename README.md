@@ -1,7 +1,7 @@
 # Server Initialization Suite
 
 A single self-contained Bash script that turns a freshly provisioned Debian or
-Ubuntu VM into a hardened Dokploy host. It is written to run unattended on
+Ubuntu VM into a Dokploy host. It is written to run unattended on
 first boot: every step is idempotent, every network operation retries, and any
 failure stops the run with the exact step, the exit code, and the tail of the
 log.
@@ -18,9 +18,10 @@ chmod +x setup.sh
 sudo ./setup.sh
 ```
 
-With no arguments the script configures the `root` account, generates an
-ed25519 SSH keypair, prints the private key to the console, disables password
-login, and installs Docker and Dokploy.
+That configures the `root` account, installs Docker and Dokploy, and leaves SSH
+authentication exactly as the image shipped it. Add `--pubkey="$(cat
+~/.ssh/id_ed25519.pub)"` to authorise a key, and `--ssh-port=N` to move the
+listening port.
 
 A more typical production invocation:
 
@@ -41,31 +42,31 @@ sudo ./setup.sh --dry-run
 
 ---
 
-## The private key
+## SSH keys
 
-When the target account has no authorized keys yet, the script generates an
-ed25519 keypair, installs the public half into `~/.ssh/authorized_keys`, and
-prints the private half to the console.
+**The script does not generate keys.** An earlier version minted an ed25519
+keypair and printed the private half to the console, which is useless to an
+unattended run — nobody is watching the terminal to copy it — and loses the
+account the moment that output scrolls away.
 
-**The private key is never written to disk and never written to the log.** The
-script keeps two output streams apart for exactly this reason: command output
-goes to `/var/log/server-init-<timestamp>.log`, and the key goes only to your
-terminal. If you close the session without copying it, it is gone.
+Keys come from one of two places, both of which exist before the run starts:
 
-Copy it, save it locally, and connect:
+1. `--pubkey="ssh-ed25519 AAAA..."` — **appended** to `~/.ssh/authorized_keys`
+   for the target account. Existing entries are never removed.
+2. Whatever `authorized_keys` the account already has, which is the normal case
+   on a cloud image where you supplied a key at creation time. It is left
+   untouched.
+
+If neither applies, the run continues anyway. Because the script no longer
+disables password authentication, an account with no keys is not a lockout —
+sshd goes on accepting whatever it accepted before. The verify step reports the
+situation and moves on.
+
+Connect the usual way once the run finishes:
 
 ```bash
-chmod 600 ~/.ssh/deploy_key
-ssh -i ~/.ssh/deploy_key -p 2222 deploy@<server-ip>
+ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@<server-ip>
 ```
-
-Use `--save-key=/root/deploy_key` if you would rather have it written to a file
-as well (mode 0600). Delete that file once you have copied it.
-
-If the account **already** has authorized keys — which is the normal case on a
-cloud image where you supplied a key at creation time — the script keeps them
-and generates nothing. Pass `--new-key` to generate an additional keypair
-anyway, or `--pubkey="ssh-ed25519 AAAA..."` to install a key you already have.
 
 ---
 
@@ -75,12 +76,9 @@ anyway, or `--pubkey="ssh-ed25519 AAAA..."` to install a key you already have.
 
 | Option | Description |
 | :--- | :--- |
-| `--username=NAME` | Account to configure. Default `root`. A non-root name is created if missing, given passwordless sudo, and root SSH login is then disabled. |
-| `--ssh-port=N` | Port for sshd. Default `22`. |
-| `--pubkey="ssh-..."` | Install this public key instead of generating a keypair. |
-| `--new-key` | Generate a fresh keypair even if the account already has authorized keys. |
-| `--save-key=PATH` | Also write the generated private key to `PATH` (mode 0600). |
-| `--keep-password-auth` | Leave SSH password login enabled. Not recommended. |
+| `--username=NAME` | Account to configure. Default `root`. A non-root name is created if missing and given passwordless sudo. Root SSH login is left as the system had it. |
+| `--ssh-port=N` | Port for sshd, and the port opened in the firewall. Default `22`. The only sshd setting the script writes. |
+| `--pubkey="ssh-..."` | Append this public key to the account's `authorized_keys`. Optional. |
 
 ### System
 
@@ -121,9 +119,9 @@ Components run in this order. Any of them can be skipped.
 
 | Component | What it does |
 | :--- | :--- |
-| `update` | Sets hostname and timezone, refreshes apt indexes, applies pending upgrades, autoremoves. |
+| `update` | Sets hostname and timezone, refreshes apt indexes, then runs a full `dist-upgrade` including phased updates, and autoremoves. Always the first step. |
 | `base` | Installs `curl`, `wget`, `git`, `jq`, `unzip`, `iproute2`, `dnsutils`, `openssh-server`, `sudo`, `ufw`, and related utilities. |
-| `ssh` | Creates the login account, installs SSH keys, and hardens sshd. |
+| `ssh` | Creates the login account, optionally appends a public key, and sets the sshd port. |
 | `firewall` | Applies the UFW baseline: deny incoming, allow outgoing, rate-limited SSH, and the Dokploy ports. |
 | `fail2ban` | Installs fail2ban with an SSH jail and a `recidive` jail, reading the systemd journal. |
 | `swap` | Creates a swapfile when the machine has under 8 GB of RAM and no swap. |
@@ -139,35 +137,42 @@ Components run in this order. Any of them can be skipped.
 
 ### SSH
 
-The account and its `authorized_keys` are set up and verified **before** sshd is
-touched. If no usable key ends up installed, the script refuses to harden sshd
-at all rather than risk a lockout.
+**The script does not harden sshd, and does not generate keys.** Both were
+removed deliberately. Every authentication directive worth setting is also a
+directive that can refuse a login, and this script is built to run unattended
+on first boot — there is nobody at the console to notice that the host stopped
+accepting connections. A hardened server you cannot reach is worse than an
+unhardened one you can.
 
-The hardened settings live in `/etc/ssh/sshd_config.d/00-server-init.conf`. The
-`00-` prefix matters: sshd keeps the **first** value it finds for a directive,
-and cloud images ship `50-cloud-init.conf` with `PasswordAuthentication yes`.
-Sorting first means nothing later can weaken the settings. For good measure the
-script also comments out the directives it owns wherever else they appear, and
-backs up every file it edits.
+What it still does to SSH:
 
-Applied settings:
+| Action | Why it is safe |
+| :--- | :--- |
+| Creates the login account with passwordless sudo | Adds a way in, never removes one |
+| Appends `--pubkey` to `authorized_keys`, if given | Append-only; existing keys are never touched |
+| Writes `Port N` to `/etc/ssh/sshd_config.d/00-server-init.conf` | Cannot deny a login on its own, and the firewall step has to agree with it |
+| Comments out `Port` elsewhere in `sshd_config.d` | sshd keeps the *first* value it finds, so a cloud image's `50-cloud-init.conf` would otherwise win |
+| Opens that port in UFW, rate-limited | |
 
-- Password and keyboard-interactive authentication disabled; `AuthenticationMethods publickey`
-- `PermitRootLogin prohibit-password`, or `no` when `--username` is not root
-- `AllowUsers` limited to the configured account
-- `MaxAuthTries 3`, `LoginGraceTime 30`, `MaxStartups 10:30:60`
-- Idle sessions dropped after 10 minutes
-- X11 and agent forwarding disabled
-- Modern key exchange, cipher, and MAC lists, filtered against what the
-  installed OpenSSH actually supports so the configuration cannot be rejected
-  on older releases
-- Diffie-Hellman moduli below 3072 bits removed
+That drop-in is the entire managed configuration:
 
-The generated configuration is validated with `sshd -t` before sshd is
-restarted. If validation fails, the drop-in is removed and SSH is left exactly
-as it was. If the *baseline* configuration also fails validation, the problem
-pre-dates this script; the hardening is kept and the real error is reported as
-a warning.
+```
+Port 2222
+```
+
+Nothing else. `PasswordAuthentication`, `PermitRootLogin`, `AllowUsers`,
+`AuthenticationMethods`, `MaxAuthTries`, `LoginGraceTime`, the
+`KexAlgorithms`/`Ciphers`/`MACs` lists, and the Diffie-Hellman moduli pruning
+were all removed. Whatever the image shipped, it keeps.
+
+The drop-in is still validated with `sshd -t` before sshd is restarted. If
+validation fails, the drop-in is removed and SSH is left exactly as it was. If
+the *baseline* configuration also fails validation, the problem pre-dates this
+script; the drop-in is kept and the real error is reported as a warning.
+
+> **Hardening is left to you.** Change the port here, then apply your own
+> authentication policy by hand, from a session you have already confirmed
+> works. That is the one thing an automated first-boot script cannot do safely.
 
 On Ubuntu 24.04 and Debian 13, sshd is socket-activated and the `Port`
 directive in `sshd_config` is ignored. The script detects this and writes a
@@ -278,15 +283,14 @@ explicitly:
 
 ## After the run
 
-1. **Copy the private key** from the console if one was generated.
-2. **Verify SSH** from a second terminal before closing the current session.
-3. **Open the Dokploy UI and create the admin account immediately** — the first
+1. **Verify SSH** from a second terminal before closing the current session.
+2. **Open the Dokploy UI and create the admin account immediately** — the first
    visitor to reach it becomes the administrator.
-4. **Attach the Cloudflare tunnel**, if you use one:
+3. **Attach the Cloudflare tunnel**, if you use one:
    ```bash
    sudo cloudflared service install <your-tunnel-token>
    ```
-5. **Reboot** if the summary reported that a reboot is required.
+4. **Reboot** if the summary reported that a reboot is required.
 
 ---
 
