@@ -17,7 +17,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # -----------------------------------------------------------------------------
@@ -96,7 +96,9 @@ SSH_KEY_SOURCE="none"
 DOKPLOY_INSTALLED=0
 
 declare -a WARNINGS=()
-declare -a SUMMARY=()
+declare -a STEP_TIMES=()  # "title|seconds", one entry per completed step
+STEP_TITLE=""
+STEP_T0=0
 
 OS_ID=""
 OS_CODENAME=""
@@ -151,28 +153,28 @@ setup_colors() {
 
   case "$depth" in
     3)
-      C_TITLE=$'\033[38;2;255;255;255m'   # white     - headings, the loudest thing
-      C_STEP=$'\033[38;2;0;255;255m'      # cyan      - step badges, product name
-      C_INFO=$'\033[38;2;43;231;255m'     # cyan      - in-progress, addresses
-      C_OK=$'\033[38;2;61;255;136m'       # spring    - completed
-      C_WARN=$'\033[38;2;255;182;39m'     # amber     - warnings
-      C_ERR=$'\033[38;2;255;77;109m'      # rose      - failures
-      C_MUTED=$'\033[38;2;163;177;209m'   # pale slate- secondary detail
-      C_RULE=$'\033[38;2;76;90;135m'      # slate     - dividers and frames
+      C_TITLE=$'\033[38;2;241;245;249m'   # soft white - headings, the loudest thing
+      C_STEP=$'\033[38;2;34;211;238m'     # cyan       - step badges, product name
+      C_INFO=$'\033[38;2;56;189;248m'     # sky        - in-progress, addresses
+      C_OK=$'\033[38;2;74;222;128m'       # green      - completed
+      C_WARN=$'\033[38;2;251;191;36m'     # amber      - warnings
+      C_ERR=$'\033[38;2;248;113;113m'     # rose       - failures
+      C_MUTED=$'\033[38;2;148;163;184m'   # slate      - secondary detail
+      C_RULE=$'\033[38;2;71;85;105m'      # deep slate - dividers and frames
       # A filled chip: cyan background, near-black text. Legible on a light
       # terminal as well as a dark one, because both halves are set here.
-      C_BADGE=$'\033[48;2;0;255;255;38;2;10;26;30;1m'
+      C_BADGE=$'\033[48;2;34;211;238;38;2;8;20;30;1m'
       ;;
     2)
-      C_TITLE=$'\033[38;5;231m'
-      C_STEP=$'\033[38;5;51m'
-      C_INFO=$'\033[38;5;51m'
-      C_OK=$'\033[38;5;48m'
+      C_TITLE=$'\033[38;5;255m'
+      C_STEP=$'\033[38;5;45m'
+      C_INFO=$'\033[38;5;45m'
+      C_OK=$'\033[38;5;78m'
       C_WARN=$'\033[38;5;214m'
       C_ERR=$'\033[38;5;203m'
       C_MUTED=$'\033[38;5;250m'
       C_RULE=$'\033[38;5;60m'
-      C_BADGE=$'\033[48;5;51;38;5;16;1m'
+      C_BADGE=$'\033[48;5;45;38;5;16;1m'
       ;;
     *)
       C_TITLE=$'\033[97m'
@@ -307,25 +309,6 @@ wrap_text() {
   return 0
 }
 
-# Join short items with " · ", starting a new line before the budget runs out.
-# Turns five one-item rows into one or two dense rows.
-join_items() {
-  local width="$1"; shift
-  local line="" item
-  for item in "$@"; do
-    if [ -z "$line" ]; then
-      line="$item"
-    elif [ $(( $(dwidth "$line") + 3 + $(dwidth "$item") )) -le "$width" ]; then
-      line="$line · $item"
-    else
-      printf '%s\n' "$line"
-      line="$item"
-    fi
-  done
-  [ -n "$line" ] && printf '%s\n' "$line"
-  return 0
-}
-
 # row <label> <value colour> <line>...
 #
 # The label is printed once; every line after the first is indented to the
@@ -395,8 +378,11 @@ die() {
 # A step header is "[n/N] Title" followed by a rule that fills whatever space
 # the title leaves, so the heading always reaches the right margin.
 step() {
+  step_finish
   STEP_INDEX=$((STEP_INDEX + 1))
   CURRENT_STEP="$1"
+  STEP_TITLE="$1"
+  STEP_T0=$SECONDS
   local count="${STEP_INDEX}/${STEP_TOTAL}"
   # The chip renders as " n/N " - one pad column either side of the count.
   local used=$(( 1 + ${#count} + 2 + 1 + ${#1} + 1 ))
@@ -409,10 +395,12 @@ step() {
   log "=== STEP ${STEP_INDEX}/${STEP_TOTAL}: $1 ==="
 }
 
-step_skipped() {
-  ui ""
-  ui " ${C_MUTED}  skip   $1 — $2${NC}"
-  log "=== SKIPPED: $1 ($2) ==="
+# Close the open step and record its duration for the summary's timing line.
+step_finish() {
+  [ -n "$STEP_TITLE" ] || return 0
+  STEP_TIMES+=("${STEP_TITLE}|$((SECONDS - STEP_T0))")
+  STEP_TITLE=""
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -918,6 +906,9 @@ banner() {
   ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC} ${C_STEP}$(rule_heavy "$fill")${NC}"
   row "System" "" "$OS_PRETTY ($ARCH) · $(uname -r)"
   row "Host" "" "$(hostname) · ${mem_total} RAM · ${disk_free}"
+  local target="user ${OPT_USERNAME} · ssh port ${OPT_SSH_PORT}"
+  [ "$OPT_TIMEZONE" = "keep" ] || target="${target} · ${OPT_TIMEZONE}"
+  row "Target" "" "$target"
   row "Log" "$C_MUTED" "$LOG_FILE"
   if [ "$OPT_DRY_RUN" -eq 1 ]; then
     row "Mode" "$C_WARN" "DRY RUN — no changes will be made"
@@ -2165,23 +2156,61 @@ version_of() {
   esac
 }
 
+fmt_secs() {
+  local s="$1"
+  if [ "$s" -ge 60 ]; then
+    printf '%dm %02ds' $((s / 60)) $((s % 60))
+  else
+    printf '%ds' "$s"
+  fi
+}
+
+# Only the steps that took five seconds or more. The fast ones are noise;
+# where the minutes went is the useful part.
+step_times_list() {
+  local e title secs out=""
+  for e in ${STEP_TIMES[@]+"${STEP_TIMES[@]}"}; do
+    title="${e%|*}"
+    secs="${e##*|}"
+    [ "$secs" -ge 5 ] || continue
+    if [ -z "$out" ]; then
+      out="${title} $(fmt_secs "$secs")"
+    else
+      out="${out} · ${title} $(fmt_secs "$secs")"
+    fi
+  done
+  printf '%s' "$out"
+  return 0
+}
+
 summary() {
   local elapsed=$((SECONDS - START_TIME))
-  local mins=$((elapsed / 60)) secs=$((elapsed % 60))
+  local nwarn=${#WARNINGS[@]}
+  local plural="s"
+  [ "$nwarn" -eq 1 ] && plural=""
 
-  local bun_bin="${SSH_USER_HOME:-/root}/.bun/bin/bun"
-  local bar="Setup complete in ${mins}m ${secs}s"
-  local fill=$(( TERM_COLS - ${#bar} - 6 ))
+  # Green when the run was clean, amber when it was not: the tail of a captured
+  # log answers "did anything go sideways?" before anyone scrolls.
+  local bar barcol="$C_OK"
+  bar="Setup complete in $(fmt_secs "$elapsed")"
+  if [ "$nwarn" -gt 0 ]; then
+    bar="${bar} — ${nwarn} warning${plural}"
+    barcol="$C_WARN"
+  fi
+  local fill=$(( TERM_COLS - $(dwidth "$bar") - 6 ))
   [ "$fill" -ge 0 ] || fill=0
   ui ""
-  ui " ${C_OK}${BOLD}━━ ${bar} $(rule_heavy "$fill")${NC}"
+  ui " ${barcol}${BOLD}━━ ${bar} $(rule_heavy "$fill")${NC}"
   ui ""
 
   # Everything else the old summary repeated - each version, the SSH settings,
-  # the warnings, the next steps - was already said once, in the step that did
-  # the work. What is left is the roll call and the two addresses, because
-  # those are the only things a reader has to carry away from the run.
+  # the next steps - was already said once, in the step that did the work. What
+  # is left is the roll call, the timing, the addresses and the warnings,
+  # because those are the only things a reader has to carry away from the run.
   para "" "$(installed_list)"
+  local times
+  times="$(step_times_list)"
+  [ -n "$times" ] && row "Time" "$C_MUTED" "$times"
   ui ""
 
   if [ -n "$PUBLIC_IP" ]; then
@@ -2201,7 +2230,29 @@ summary() {
     fi
   fi
   row "Log" "$C_MUTED" "$LOG_FILE"
+
+  # The warnings again, in one place. During the run each one scrolled past
+  # inside its own step; an unattended log is read from the tail, so the recap
+  # has to be the last thing printed.
+  if [ "$nwarn" -gt 0 ]; then
+    ui ""
+    ui "   ${C_WARN}${BOLD}!${NC} ${C_TITLE}${BOLD}${nwarn} warning${plural} from this run${NC}"
+    local w out first avail=$(( TERM_COLS - 9 ))
+    [ "$avail" -ge 24 ] || avail=24
+    for w in ${WARNINGS[@]+"${WARNINGS[@]}"}; do
+      first=1
+      while IFS= read -r out; do
+        if [ "$first" -eq 1 ]; then
+          ui "     ${C_WARN}·${NC} ${C_WARN}${out}${NC}"
+          first=0
+        else
+          ui "       ${C_WARN}${out}${NC}"
+        fi
+      done < <(wrap_text "$avail" "$w")
+    done
+  fi
   ui ""
+  log "RESULT: success warnings=${nwarn} elapsed=${elapsed}s"
 }
 
 # The address to print in the connect command.
@@ -2298,31 +2349,42 @@ main() {
   if ! ( umask 077; : >"$LOG_FILE" ) 2>/dev/null; then
     LOG_FILE="$(mktemp -t server-init-XXXXXX.log)"
   fi
+  # A stable name for the newest log, so fleet tooling can tail or collect it
+  # without globbing on timestamps.
+  ln -sfn "$LOG_FILE" "${LOG_FILE%/*}/server-init.latest.log" 2>/dev/null || true
   log "$SCRIPT_NAME v$SCRIPT_VERSION starting; args: $*"
 
   preflight
 
-  # Count the steps that will actually run, so [n/total] is honest.
+  # Split the roster up front, so [n/total] is honest and the skipped
+  # components cost one quiet line instead of a stanza each. With --only=ssh
+  # the old layout printed twelve skip blocks before any work started.
   local entry name
-  STEP_TOTAL=0
+  local -a to_run=() skipped=()
   for entry in "${COMPONENTS[@]}"; do
-    is_enabled "${entry%%:*}" && STEP_TOTAL=$((STEP_TOTAL + 1))
+    name="${entry%%:*}"
+    if is_enabled "$name"; then to_run+=("$name"); else skipped+=("$name"); fi
   done
+  STEP_TOTAL=${#to_run[@]}
   [ "$STEP_TOTAL" -gt 0 ] || die "Every component was excluded; nothing to do."
+
+  if [ ${#skipped[@]} -gt 0 ]; then
+    local skip_list=""
+    for name in "${skipped[@]}"; do
+      if [ -z "$skip_list" ]; then skip_list="$name"; else skip_list="${skip_list} · ${name}"; fi
+    done
+    row "Skipped" "$C_MUTED" "$skip_list"
+  fi
 
   # Needed by fn_bun and the summary even when the ssh component is skipped.
   if id -u "$OPT_USERNAME" >/dev/null 2>&1; then
     SSH_USER_HOME="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
   fi
 
-  for entry in "${COMPONENTS[@]}"; do
-    name="${entry%%:*}"
-    if is_enabled "$name"; then
-      "fn_${name}"
-    else
-      step_skipped "$name" "${entry#*:}"
-    fi
+  for name in ${to_run[@]+"${to_run[@]}"}; do
+    "fn_${name}"
   done
+  step_finish
 
   PUBLIC_IP="$(detect_public_ip)"
 
