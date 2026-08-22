@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!*.md
+!setup.sh
+!.gitignore
+!lib
