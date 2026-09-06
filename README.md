@@ -127,6 +127,7 @@ ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@<server-ip>
 | `--hostname=NAME` | Set the system hostname (and keep `/etc/hosts` consistent). |
 | `--timezone=ZONE` | Set the timezone, e.g. `Europe/Amsterdam`. |
 | `--ui-allow=CIDR[,CIDR]` | Restrict the Dokploy UI on port 3000 to these sources. See [Dokploy UI exposure](#dokploy-ui-exposure). |
+| `--local` | Allow the private ranges (`10/8`, `172.16/12`, `192.168/16`) to reach the Dokploy UI. The shorthand for "reachable from my LAN" without naming a subnet. Adds to `--ui-allow` rather than replacing it. |
 | `--ui-public` | Expose the Dokploy UI to the whole internet. The first visitor to reach it becomes the admin. |
 | `--auto-reboot=HH:MM` | Let unattended-upgrades reboot in this window when a patch needs it. Default: never reboot automatically, which means kernel patches stay inactive until a manual reboot. |
 | `--remove-snapd` | Purge snapd and hold the package (Ubuntu). Off by default: a Docker host does not need it, but removing a package manager should be asked for, not assumed. |
@@ -246,18 +247,39 @@ adds for ports 80, 443 and 3000 do not restrict Dokploy's containers.
 Dokploy's admin account is created by whoever loads the UI first. On a public
 IP with port 3000 open, that can be someone else.
 
-Pass `--ui-allow` with the addresses that should reach the UI:
+By default port 3000 is closed to the network entirely. Loopback is unaffected —
+a published port reached over `127.0.0.1` never traverses the `FORWARD` chain —
+so an SSH tunnel works with no rules at all, but **another machine on your LAN
+cannot reach it**. That is deliberate, and it is what `--local` opts out of:
+
+```bash
+# reachable from any private address (10/8, 172.16/12, 192.168/16)
+sudo ./setup.sh --only=dokploy --local
+```
+
+Or name the sources exactly, which is tighter:
 
 ```bash
 sudo ./setup.sh --only=dokploy --ui-allow=203.0.113.9/32,198.51.100.0/24
 ```
+
+The two add up, so `--local --ui-allow=100.64.0.0/10` gets you the LAN plus a
+Tailscale range. `100.64.0.0/10` is deliberately **not** part of `--local`: it is
+CGNAT space, handed out by ISPs as well as by overlay networks, so including it
+by default would expose the UI to strangers on a CGNAT'd connection.
 
 That installs a rule in the `DOCKER-USER` chain — the only place Docker
 respects — and a small systemd unit that re-applies it at boot, since iptables
 rules do not persist. Alternatively, leave port 3000 closed to the world and
 reach the UI through the Cloudflare tunnel the script installs.
 
-Without `--ui-allow` the script warns loudly and continues.
+To see the rule currently in force:
+
+```bash
+sudo iptables -L DOKPLOY-UI -n -v
+```
+
+A chain containing only a `DROP` is the default, closed state.
 
 ### fail2ban
 

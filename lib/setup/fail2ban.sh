@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: fail2ban
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: fail2ban - Install and pre-configure fail2ban for SSH
 #

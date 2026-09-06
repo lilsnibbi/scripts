@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: dokploy
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: dokploy - Install the Dokploy PaaS platform
 #
@@ -135,7 +135,8 @@ restrict_dokploy_ui() {
   fi
 
   local script=/usr/local/sbin/dokploy-ui-firewall
-  local cidrs="$OPT_UI_ALLOW"
+  local cidrs
+  cidrs="$(ui_allow_list)"
   local body
   body="$(cat <<SCRIPT
 #!/usr/bin/env bash
@@ -179,12 +180,13 @@ UNIT
   run systemctl daemon-reload
   run systemctl enable dokploy-ui-firewall.service || true
   if run systemctl restart dokploy-ui-firewall.service; then
-    if [ -n "$OPT_UI_ALLOW" ]; then
-      ok "Dokploy UI on port 3000 restricted to: $OPT_UI_ALLOW"
+    if [ -n "$cidrs" ]; then
+      ok "Dokploy UI on port 3000 restricted to: $cidrs"
     else
       ok "Dokploy UI on port 3000 closed to the network"
       detail "Reach it over an SSH tunnel, the Cloudflare tunnel, or reopen it with:"
-      detail "  sudo ./setup.sh --only=dokploy --ui-allow=<your.ip>/32"
+      detail "  sudo ./setup.sh --only=dokploy --local            (your LAN)"
+      detail "  sudo ./setup.sh --only=dokploy --ui-allow=<ip>/32 (one address)"
     fi
   else
     warn "Could not apply the port 3000 restriction; the UI may be publicly reachable."

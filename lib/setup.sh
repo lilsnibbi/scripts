@@ -31,7 +31,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -43,7 +43,9 @@ SETUP_BASE="${SETUP_BASE:-}"
 # Bumped only when a helper that modules depend on changes incompatibly. Every
 # module declares the API it was written against, and a mismatch aborts the run
 # before anything is touched rather than failing halfway through.
-SETUP_API=1
+#
+# 2: added ui_allow_list, which the dokploy module calls.
+SETUP_API=2
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -78,6 +80,7 @@ OPT_TIMEZONE="UTC"
 OPT_TIMEZONE_SET=0
 OPT_UI_ALLOW=""
 OPT_UI_PUBLIC=0
+OPT_UI_LOCAL=0
 OPT_AUTO_REBOOT=""
 OPT_EXCLUDE=""
 OPT_ONLY=""
@@ -739,6 +742,10 @@ usage() {
   ui "                        Dokploy UI on port 3000. Without it the port is"
   ui "                        closed to the network and reachable only over an"
   ui "                        SSH or Cloudflare tunnel."
+  ui "   ${C_INFO}--local${NC}              Allow the private ranges (10/8, 172.16/12,"
+  ui "                        192.168/16) to reach the Dokploy UI on port 3000."
+  ui "                        The shorthand for reaching it from your own LAN"
+  ui "                        without naming a subnet. Adds to --ui-allow."
   ui "   ${C_INFO}--ui-public${NC}          Expose the Dokploy UI to the whole internet."
   ui "                        ${C_WARN}The first visitor to reach it becomes the admin.${NC}"
   ui "   ${C_INFO}--auto-reboot=HH:MM${NC}  Let unattended-upgrades reboot in this window when a"
@@ -770,6 +777,7 @@ usage() {
   ui " ${C_TITLE}${BOLD}Examples${NC}"
   ui "   ${C_MUTED}curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash -s -- --pubkey=\"\$(cat ~/.ssh/id_ed25519.pub)\"${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --username=deploy --ssh-port=2222 --ui-allow=203.0.113.9/32${NC}"
+  ui "   ${C_MUTED}sudo ./setup.sh --local${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --exclude=bun,cloudflared${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --only=ssh,firewall,fail2ban${NC}"
   ui ""
@@ -812,6 +820,7 @@ parse_args() {
       --timezone=*)          OPT_TIMEZONE="$value"; OPT_TIMEZONE_SET=1 ;;
       --ui-allow=*)          OPT_UI_ALLOW="$value" ;;
       --ui-public)           OPT_UI_PUBLIC=1 ;;
+      --local)               OPT_UI_LOCAL=1 ;;
       --auto-reboot=*)       OPT_AUTO_REBOOT="$value" ;;
       --exclude=*)           OPT_EXCLUDE="$value" ;;
       --only=*)              OPT_ONLY="$value" ;;
@@ -880,6 +889,12 @@ validate_args() {
     die "--ui-allow and --ui-public cannot be combined"
   fi
 
+  # --local narrows, --ui-public opens to everything: asking for both is asking
+  # for two different answers. --local with --ui-allow is fine and adds up.
+  if [ "$OPT_UI_LOCAL" -eq 1 ] && [ "$OPT_UI_PUBLIC" -eq 1 ]; then
+    die "--local and --ui-public cannot be combined"
+  fi
+
   # A malformed CIDR would otherwise surface much later, as an iptables error
   # inside the boot-time firewall unit - with port 3000 left open. Fail here.
   if [ -n "$OPT_UI_ALLOW" ]; then
@@ -894,6 +909,24 @@ validate_args() {
   if [ -n "$OPT_AUTO_REBOOT" ] && ! [[ "$OPT_AUTO_REBOOT" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
     die "--auto-reboot must be a 24-hour time such as 03:30 (got: $OPT_AUTO_REBOOT)"
   fi
+}
+
+# The private ranges --local stands for: RFC1918, and nothing else. Tailscale
+# and other CGNAT overlays live in 100.64.0.0/10, which is deliberately absent -
+# that range is also handed out by ISPs, so allowing it by default would open
+# the UI to strangers on a CGNAT'd connection. Add it explicitly if you want it:
+#   --local --ui-allow=100.64.0.0/10
+UI_LOCAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+# The effective source list for the Dokploy UI port. Empty means the port is
+# closed to everything except loopback. Shared by the dokploy component, which
+# writes the iptables rule, and the summary, which reports the address.
+ui_allow_list() {
+  local out="$OPT_UI_ALLOW"
+  if [ "$OPT_UI_LOCAL" -eq 1 ]; then
+    if [ -n "$out" ]; then out="${out},${UI_LOCAL_CIDRS}"; else out="$UI_LOCAL_CIDRS"; fi
+  fi
+  printf '%s' "$out"
 }
 
 is_enabled() {
@@ -1283,12 +1316,14 @@ summary() {
     row "Connect" "$C_INFO" "ssh -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
     is_private_ip "$PUBLIC_IP" && row "" "$C_MUTED" "that is a private address — reachable from this network only" || true
     if [ "$DOKPLOY_INSTALLED" -eq 1 ]; then
+      local allow
+      allow="$(ui_allow_list)"
       if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
         row "Dokploy" "$C_INFO" "http://${PUBLIC_IP}:3000"
         row "" "$C_WARN" "open to the internet — claim the admin account now"
-      elif [ -n "$OPT_UI_ALLOW" ]; then
+      elif [ -n "$allow" ]; then
         row "Dokploy" "$C_INFO" "http://${PUBLIC_IP}:3000"
-        row "" "$C_MUTED" "reachable from ${OPT_UI_ALLOW} only"
+        row "" "$C_MUTED" "reachable from ${allow} only"
       else
         row "Dokploy" "$C_INFO" "ssh -L 3000:localhost:3000 -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
         row "" "$C_MUTED" "then open http://localhost:3000 (port 3000 is closed)"

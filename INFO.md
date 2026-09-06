@@ -15,7 +15,9 @@ Runs before anything touches the system.
    names in `--exclude` or `--only`, and combining those two flags.
 2. **Validate values.** The SSH port must be 1–65535, the username must be a
    valid Linux user name, a supplied public key must look like an OpenSSH key,
-   and a supplied timezone must exist in `/usr/share/zoneinfo`.
+   and a supplied timezone must exist in `/usr/share/zoneinfo`. `--ui-public`
+   cannot be combined with `--ui-allow` or `--local`, which ask for the
+   opposite; `--ui-allow` and `--local` may be combined and add up.
 3. **Resolve the module source.** `--base`, then the `SETUP_BASE` environment
    variable, then a `setup/` directory beside the script (a checkout), then the
    default `https://lilsnibbi.dev/scripts`.
@@ -305,13 +307,26 @@ months after anyone last looked at it.
    shebang before execution, so an error page or captive portal response is
    never piped into a shell.
 4. **Run it**, then wait up to 90 seconds for the UI to answer on port 3000.
-5. **Restrict the UI** if `--ui-allow` was given.
+5. **Restrict the UI.** Always, unless `--ui-public` was given.
 
 The restriction is implemented as a rule in the `DOCKER-USER` iptables chain,
 re-applied at boot by a small systemd unit, because Docker's rules run ahead of
-UFW's and iptables rules do not persist. Without `--ui-allow` the script warns
-that port 3000 is reachable from the internet and that whoever loads it first
-becomes the Dokploy administrator.
+UFW's and iptables rules do not persist.
+
+The allowed sources are whatever `--ui-allow` named, plus the RFC1918 ranges
+when `--local` was given; the two add up. With neither, the chain is a bare
+`DROP` and the port is closed to everything except loopback — which is why an
+SSH tunnel works out of the box but another machine on the LAN does not. That
+is the intended default: the window between this script finishing and a human
+claiming the admin account is exactly the window an internet-wide scanner
+needs, and the first visitor to an unclaimed Dokploy UI becomes its
+administrator.
+
+`--local` covers `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` only.
+`100.64.0.0/10` is excluded on purpose: Tailscale and other overlays use it,
+but so do ISPs for CGNAT, so allowing it by default would expose the UI to
+other customers on a CGNAT'd connection. Ask for it explicitly with
+`--local --ui-allow=100.64.0.0/10`.
 
 ### 11. `cloudflared` — Cloudflare Tunnel
 

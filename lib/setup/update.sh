@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: update
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: update - Refresh apt indexes and apply every pending upgrade
 #

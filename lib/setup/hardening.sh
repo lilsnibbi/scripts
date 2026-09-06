@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: hardening
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: hardening - Kernel network hardening, journald limits, root
 #  password lock

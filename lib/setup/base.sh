@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: base
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: base - Install base utilities
 #

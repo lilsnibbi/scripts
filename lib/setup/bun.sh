@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: bun
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: bun - Install the Bun JavaScript runtime
 #

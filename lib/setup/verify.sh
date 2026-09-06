@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: verify
-# setup-api: 1
+# setup-api: 2
 # =============================================================================
 #  Component: verify - Check sshd, the firewall and the login account
 #
