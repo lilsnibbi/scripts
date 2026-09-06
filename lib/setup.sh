@@ -2,8 +2,19 @@
 # =============================================================================
 #  setup.sh - Server Initialization Suite
 #
-#  Bootstraps a fresh Debian or Ubuntu VM: system updates, the login account,
-#  firewall, fail2ban, Docker, Dokploy, and unattended security updates.
+#  Bootstraps a fresh Debian or Ubuntu machine - Proxmox VM or container, KVM
+#  guest, VPS, dedicated box, or a laptop serving as one: system updates, the
+#  login account, firewall, fail2ban, performance tuning, Docker, Dokploy, and
+#  unattended security updates.
+#
+#  This file is the framework: options, console output, journal logging, the
+#  helpers every component relies on, preflight, and the summary. The
+#  components themselves live one per file in setup/<name>.sh. Only the
+#  modules for the components that will run are fetched, all of them before
+#  any component runs, so a missing or broken module aborts the run while the
+#  machine is still untouched.
+#
+#    curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- [options]
 #
 #  It deliberately does NOT harden sshd. The only sshd setting it writes is
 #  Port, and it generates no keys. Rewriting authentication from an unattended
@@ -11,14 +22,28 @@
 #
 #  Designed to run unattended on first boot. Every step is idempotent and safe
 #  to re-run.
-#
-#  Usage: sudo ./setup.sh [options]     (see --help)
 # =============================================================================
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.1.0"
+# The script is started more ways than one - through sudo, from a Proxmox
+# 'pct exec', from cloud-init, from a bare root shell - and not all of them put
+# the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
+SCRIPT_VERSION="3.0.0"
 SCRIPT_NAME="Server Initialization Suite"
+
+# Where the component modules come from; setup/<name>.sh is appended. In
+# order of precedence: --base=..., the SETUP_BASE environment variable, the
+# setup/ directory beside this file when run from a checkout, this default.
+SETUP_BASE_DEFAULT="https://lilsnibbi.dev/scripts"
+SETUP_BASE="${SETUP_BASE:-}"
+
+# Bumped only when a helper that modules depend on changes incompatibly. Every
+# module declares the API it was written against, and a mismatch aborts the run
+# before anything is touched rather than failing halfway through.
+SETUP_API=1
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -56,14 +81,17 @@ OPT_UI_PUBLIC=0
 OPT_AUTO_REBOOT=""
 OPT_EXCLUDE=""
 OPT_ONLY=""
+OPT_BASE=""
 OPT_RESET_FIREWALL=0
 OPT_REINSTALL_DOKPLOY=0
+OPT_REMOVE_SNAPD=0
 OPT_DRY_RUN=0
 OPT_VERBOSE=0
 OPT_NO_COLOR=0
 
 # -----------------------------------------------------------------------------
-# Components, in execution order. "name:description".
+# Components, in execution order. "name:description". Each one is implemented
+# by setup/<name>.sh, which must define fn_<name>.
 # -----------------------------------------------------------------------------
 COMPONENTS=(
   "update:Refresh apt indexes and apply every pending upgrade"
@@ -72,6 +100,7 @@ COMPONENTS=(
   "firewall:Configure the UFW firewall"
   "fail2ban:Install and pre-configure fail2ban for SSH"
   "hardening:Kernel network hardening, journald limits, root password lock"
+  "tuning:Performance tuning: network stack, limits, power, CPU governor"
   "swap:Create a swapfile when RAM is small and no swap exists"
   "docker:Install Docker CE with container log rotation"
   "dokploy:Install the Dokploy PaaS platform"
@@ -84,7 +113,11 @@ COMPONENTS=(
 # -----------------------------------------------------------------------------
 # Runtime state
 # -----------------------------------------------------------------------------
-LOG_FILE=""
+# No log file is ever written. Everything goes to the systemd journal under
+# this tag; LOG_HINT is the command a human types to read it back.
+LOG_TAG="server-init"
+LOG_HINT="journalctl -t server-init"
+LOG_READY=0
 APT_UPDATED=0
 CURRENT_STEP="startup"
 STEP_INDEX=0
@@ -92,6 +125,11 @@ STEP_TOTAL=0
 TTY=0
 START_TIME=$SECONDS
 
+MODULE_DIR=""
+declare -a TO_RUN=()
+declare -a SKIPPED=()
+
+SSH_USER_HOME=""
 SSH_KEY_SOURCE="none"
 DOKPLOY_INSTALLED=0
 
@@ -238,15 +276,16 @@ detect_width() {
 # -----------------------------------------------------------------------------
 # Logging and console output.
 #
-# The console (fd 3) and the log file are deliberately separate streams: command
-# output goes only to the log, so a run reads as a list of outcomes rather than
-# a wall of apt and docker chatter.
+# The console (fd 3) and the log are deliberately separate streams: command
+# output goes to the systemd journal (fd 4), so a run reads as a list of
+# outcomes rather than a wall of apt and docker chatter, and nothing is ever
+# written to a file. journald timestamps every line itself.
 # -----------------------------------------------------------------------------
 strip_ansi() { printf '%s' "$1" | sed -e 's/\x1b\[[0-9;]*m//g'; }
 
 log() {
-  [ -n "$LOG_FILE" ] || return 0
-  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG_FILE"
+  [ "$LOG_READY" -eq 1 ] || return 0
+  printf '%s\n' "$*" >&4 2>/dev/null || true
 }
 
 ui() { printf '%b\n' "$*" >&3; }
@@ -292,7 +331,11 @@ dwidth() {
 }
 
 # Greedy word wrap to a column budget. One wrapped line per output line.
+# Always invoked via process substitution, so set -f is confined to the
+# subshell; without it a message containing a glob ('*.conf', say) would be
+# expanded against the working directory.
 wrap_text() {
+  set -f
   local width="$1"; shift
   local line="" word
   for word in $*; do
@@ -369,7 +412,7 @@ warn() {
 die() {
   ui ""
   ui "${C_ERR}${BOLD}  ✖ $1${NC}"
-  [ -n "$LOG_FILE" ] && ui "${C_MUTED}    Log: ${LOG_FILE}${NC}"
+  [ "$LOG_READY" -eq 1 ] && ui "${C_MUTED}    Log: ${LOG_HINT}${NC}"
   ui ""
   log "FATAL: $(strip_ansi "$1")"
   exit "${2:-1}"
@@ -404,7 +447,7 @@ step_finish() {
 }
 
 # -----------------------------------------------------------------------------
-# Error handling
+# Error handling and cleanup
 # -----------------------------------------------------------------------------
 on_error() {
   local rc=$1 line=$2
@@ -416,17 +459,32 @@ on_error() {
   ui ""
   ui "${C_ERR}${BOLD}  ✖ Failed during: ${CURRENT_STEP}${NC}"
   ui "${C_ERR}    exit ${rc} at line ${line}${NC}"
-  if [ -n "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+  if [ "$LOG_READY" -eq 1 ] && have journalctl; then
+    # Let systemd-cat drain what is still sitting in the pipe before asking
+    # journald to flush, or the last lines are exactly the ones missing.
+    sleep 0.3
+    journalctl --sync 2>/dev/null || true
     ui ""
     ui "${C_MUTED}    Last 20 log lines:${NC}"
-    sed 's/^/      /' <(tail -n 20 "$LOG_FILE") >&3 2>/dev/null || true
+    journalctl -t "$LOG_TAG" -n 20 --no-pager -o cat 2>/dev/null | sed 's/^/      /' >&3 || true
   fi
   ui ""
-  ui "    Full log: ${BOLD}${LOG_FILE}${NC}"
+  ui "    Full log: ${BOLD}${LOG_HINT}${NC}"
   ui ""
   exit "$rc"
 }
 trap 'on_error $? $LINENO' ERR
+
+cleanup() {
+  show_cursor
+  # Only the main shell owns the module directory; a subshell that happens to
+  # run this trap must not pull the files out from under it.
+  if [ "${BASHPID:-$$}" = "$$" ] && [ -n "$MODULE_DIR" ]; then
+    rm -rf "$MODULE_DIR"
+  fi
+  return 0
+}
+trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
 # Command execution helpers
@@ -438,7 +496,7 @@ run() {
     log "  (dry-run: not executed)"
     return 0
   fi
-  "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+  "$@" >&4 2>&1 || rc=$?
   [ $rc -eq 0 ] || log "  ! exited $rc"
   return $rc
 }
@@ -450,7 +508,7 @@ run_sh() {
     log "  (dry-run: not executed)"
     return 0
   fi
-  bash -c "$1" >>"$LOG_FILE" 2>&1 || rc=$?
+  bash -c "$1" >&4 2>&1 || rc=$?
   [ $rc -eq 0 ] || log "  ! exited $rc"
   return $rc
 }
@@ -473,7 +531,6 @@ show_cursor() {
   fi
   return 0
 }
-trap show_cursor EXIT
 
 # Draw one transient spinner frame. The message is truncated so the rendered
 # line always fits on a single row; without this a long message wraps and every
@@ -490,25 +547,32 @@ spin_draw() {
 }
 
 # Long-running command with a spinner on a terminal, plain line otherwise.
+# Honours --dry-run; spin() below is the same thing for work that must happen
+# even then, such as fetching the modules a dry run needs to describe.
 run_spin() {
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    detail "$1 (dry-run)"
+    log "+ ${*:2}"
+    return 0
+  fi
+  spin "$@"
+}
+
+spin() {
   local msg="$1"; shift
   local rc=0
 
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "$msg (dry-run)"
-    log "+ $*"
-    return 0
-  fi
-
   if [ "$TTY" -eq 0 ] || [ "$OPT_VERBOSE" -eq 1 ]; then
     detail "$msg"
-    run "$@"
-    return $?
+    log "+ $*"
+    "$@" >&4 2>&1 || rc=$?
+    [ $rc -eq 0 ] || log "  ! exited $rc"
+    return $rc
   fi
 
   log "+ $*"
   hide_cursor
-  "$@" >>"$LOG_FILE" 2>&1 &
+  "$@" >&4 2>&1 &
   local pid=$! i=0 started=$SECONDS elapsed=0 suffix=""
   while kill -0 "$pid" 2>/dev/null; do
     elapsed=$((SECONDS - started))
@@ -542,7 +606,7 @@ retry() {
   local max=3 n=1 rc=0
   while :; do
     rc=0
-    "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+    "$@" >&4 2>&1 || rc=$?
     [ $rc -eq 0 ] && return 0
     if [ $n -ge $max ]; then
       log "  ! giving up after $n attempts (rc=$rc): $*"
@@ -583,6 +647,11 @@ apt_ensure_lists() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# LXC (Proxmox CT), Docker, systemd-nspawn and friends. Several things a VM or
+# a physical machine owns - the clock, swap, the CPU governor, power management
+# - belong to the host in a container, and the components skip them there.
+in_container() { systemd-detect-virt --container >/dev/null 2>&1; }
+
 backup_file() {
   local f="$1"
   [ -f "$f" ] || return 0
@@ -612,6 +681,33 @@ write_file() {
 }
 
 # -----------------------------------------------------------------------------
+# Login account helpers, shared by the ssh, hardening, bun and verify
+# components and by the summary.
+# -----------------------------------------------------------------------------
+resolve_user_home() {
+  [ -n "$SSH_USER_HOME" ] && return 0
+  SSH_USER_HOME="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -z "$SSH_USER_HOME" ] && [ "$OPT_DRY_RUN" -eq 1 ]; then
+    SSH_USER_HOME="/home/$OPT_USERNAME"
+  fi
+  return 0
+}
+
+ssh_authorized_keys_path() {
+  printf '%s/.ssh/authorized_keys' "$SSH_USER_HOME"
+}
+
+ssh_count_keys() {
+  local f n
+  f="$(ssh_authorized_keys_path)"
+  [ -f "$f" ] || { echo 0; return 0; }
+  # grep -c prints 0 and exits 1 when nothing matches, so swallow the status
+  # instead of appending a second line of output.
+  n="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || true)"
+  echo "${n:-0}"
+}
+
+# -----------------------------------------------------------------------------
 # Usage
 # -----------------------------------------------------------------------------
 usage() {
@@ -621,7 +717,8 @@ usage() {
   ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC}"
   ui " ${C_RULE}${RULE}${NC}"
   ui ""
-  ui " ${C_TITLE}${BOLD}Usage:${NC} sudo ./setup.sh [options]"
+  ui " ${C_TITLE}${BOLD}Usage:${NC} curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash -s -- [options]"
+  ui "        sudo ./setup.sh [options]"
   ui ""
   ui " ${C_TITLE}${BOLD}Account and SSH${NC}"
   ui "   ${C_INFO}--username=NAME${NC}      Login account to configure. Default: ${BOLD}root${NC}."
@@ -647,6 +744,9 @@ usage() {
   ui "   ${C_INFO}--auto-reboot=HH:MM${NC}  Let unattended-upgrades reboot in this window when a"
   ui "                        patch needs it. Default: never reboot on its own,"
   ui "                        which means kernel patches stay inactive."
+  ui "   ${C_INFO}--remove-snapd${NC}       Purge snapd and hold the package (Ubuntu). Off by"
+  ui "                        default; a Docker host does not need it, but removing"
+  ui "                        a package manager should be asked for, not assumed."
   ui "   ${C_INFO}--reset-firewall${NC}     Wipe existing UFW rules before applying the baseline."
   ui "   ${C_INFO}--reinstall-dokploy${NC}  Reinstall Dokploy even if it is already present."
   ui "                        ${C_WARN}Destructive: leaves and re-initialises Docker Swarm.${NC}"
@@ -657,6 +757,10 @@ usage() {
   ui "   ${C_INFO}--list${NC}               List components and exit."
   ui ""
   ui " ${C_TITLE}${BOLD}Behaviour${NC}"
+  ui "   ${C_INFO}--base=URL${NC}           Fetch component modules from URL/setup/<name>.sh."
+  ui "                        Also accepts an absolute directory. Default:"
+  ui "                        ${SETUP_BASE_DEFAULT}, or the setup/"
+  ui "                        directory beside the script when run from a checkout."
   ui "   ${C_INFO}--dry-run${NC}            Show what would happen, change nothing."
   ui "   ${C_INFO}--verbose${NC}            Disable the spinner, print each action as a line."
   ui "   ${C_INFO}--no-color${NC}           Disable coloured output."
@@ -664,7 +768,7 @@ usage() {
   ui "   ${C_INFO}--help${NC}               Show this help and exit."
   ui ""
   ui " ${C_TITLE}${BOLD}Examples${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --pubkey=\"\$(cat ~/.ssh/id_ed25519.pub)\"${NC}"
+  ui "   ${C_MUTED}curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash -s -- --pubkey=\"\$(cat ~/.ssh/id_ed25519.pub)\"${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --username=deploy --ssh-port=2222 --ui-allow=203.0.113.9/32${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --exclude=bun,cloudflared${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --only=ssh,firewall,fail2ban${NC}"
@@ -711,8 +815,10 @@ parse_args() {
       --auto-reboot=*)       OPT_AUTO_REBOOT="$value" ;;
       --exclude=*)           OPT_EXCLUDE="$value" ;;
       --only=*)              OPT_ONLY="$value" ;;
+      --base=*)              OPT_BASE="$value" ;;
       --reset-firewall)      OPT_RESET_FIREWALL=1 ;;
       --reinstall-dokploy)   OPT_REINSTALL_DOKPLOY=1 ;;
+      --remove-snapd)        OPT_REMOVE_SNAPD=1 ;;
       --dry-run)             OPT_DRY_RUN=1 ;;
       --verbose)             OPT_VERBOSE=1 ;;
       --no-color)            OPT_NO_COLOR=1 ;;
@@ -758,6 +864,10 @@ validate_args() {
     done
   done
 
+  if [ -n "$OPT_BASE" ] && ! [[ "$OPT_BASE" =~ ^(https?://[^[:space:]]+|/[^[:space:]]*)$ ]]; then
+    die "--base must be an http(s) URL or an absolute directory (got: $OPT_BASE)"
+  fi
+
   # Only a zone the caller actually asked for is worth dying over. The default
   # is the script's own choice, and an image without tzdata has no zoneinfo at
   # all - failing there would mean a default that breaks the run.
@@ -768,6 +878,17 @@ validate_args() {
 
   if [ -n "$OPT_UI_ALLOW" ] && [ "$OPT_UI_PUBLIC" -eq 1 ]; then
     die "--ui-allow and --ui-public cannot be combined"
+  fi
+
+  # A malformed CIDR would otherwise surface much later, as an iptables error
+  # inside the boot-time firewall unit - with port 3000 left open. Fail here.
+  if [ -n "$OPT_UI_ALLOW" ]; then
+    local cidr
+    for cidr in ${OPT_UI_ALLOW//,/ }; do
+      if ! [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
+        die "--ui-allow contains an invalid IPv4 address or CIDR: $cidr"
+      fi
+    done
   fi
 
   if [ -n "$OPT_AUTO_REBOOT" ] && ! [[ "$OPT_AUTO_REBOOT" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
@@ -787,6 +908,98 @@ is_enabled() {
     [ "$candidate" = "$name" ] && return 1
   done
   return 0
+}
+
+# Split the roster up front, so [n/total] is honest and the skipped components
+# cost one quiet line instead of a stanza each.
+plan_components() {
+  local entry name
+  for entry in "${COMPONENTS[@]}"; do
+    name="${entry%%:*}"
+    if is_enabled "$name"; then TO_RUN+=("$name"); else SKIPPED+=("$name"); fi
+  done
+  STEP_TOTAL=${#TO_RUN[@]}
+  [ "$STEP_TOTAL" -gt 0 ] || die "Every component was excluded; nothing to do."
+}
+
+# =============================================================================
+# Component modules
+#
+# setup/<name>.sh, one per component, fetched from SETUP_BASE or read from the
+# checkout. Every module carries three markers - its name, the setup-api it was
+# written against, and an end-of-module line - so a wrong file, a stale file
+# and a truncated download are each caught before anything is sourced.
+# =============================================================================
+resolve_base() {
+  local self dir
+  if [ -n "$OPT_BASE" ]; then
+    SETUP_BASE="$OPT_BASE"
+  elif [ -z "$SETUP_BASE" ]; then
+    # Run from a checkout: the modules beside the script win over the network,
+    # which is what makes a branch testable before it is published.
+    self="${BASH_SOURCE[0]:-}"
+    if [ -n "$self" ] && [ -f "$self" ]; then
+      dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd -P || true)"
+      [ -n "$dir" ] && [ -d "$dir/setup" ] && SETUP_BASE="$dir"
+    fi
+    [ -n "$SETUP_BASE" ] || SETUP_BASE="$SETUP_BASE_DEFAULT"
+  fi
+  SETUP_BASE="${SETUP_BASE%/}"
+}
+
+base_is_local() { [ "${SETUP_BASE#/}" != "$SETUP_BASE" ]; }
+
+module_url() { printf '%s/setup/%s.sh' "$SETUP_BASE" "$1"; }
+
+# Runs under the spinner, so the source that failed is left in a file for the
+# caller to name in its error.
+fetch_modules() {
+  local name url dst
+  for name in "$@"; do
+    url="$(module_url "$name")"
+    dst="$MODULE_DIR/$name.sh"
+    log "module: $url"
+    if base_is_local; then
+      cp "$url" "$dst" || { printf '%s' "$url" >"$MODULE_DIR/.failed"; return 1; }
+    else
+      retry curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$dst" \
+        || { printf '%s' "$url" >"$MODULE_DIR/.failed"; return 1; }
+    fi
+  done
+  return 0
+}
+
+verify_module() {
+  local name="$1" path="$2" src api
+  src="$(module_url "$name")"
+  [ -s "$path" ] || die "Module '$name' is empty. Source: $src"
+  grep -qx "# setup-module: $name" "$path" \
+    || die "Module '$name' is not a setup.sh component module. Source: $src"
+  api="$(sed -n 's/^# setup-api: \([0-9][0-9]*\)$/\1/p' "$path" | head -n1 || true)"
+  [ "$api" = "$SETUP_API" ] \
+    || die "Module '$name' was written for setup-api ${api:-?}, this script is setup-api ${SETUP_API}. The published files are out of sync; retry in a few minutes."
+  tail -n 3 "$path" | grep -qx '# end-of-module' \
+    || die "Module '$name' is truncated (no end-of-module marker). Source: $src"
+  bash -n "$path" >&4 2>&1 || die "Module '$name' failed the syntax check; see: ${LOG_HINT}"
+}
+
+load_modules() {
+  local name path msg
+  MODULE_DIR="$(mktemp -d)" || die "Could not create a temporary directory for the modules."
+  if base_is_local; then
+    msg="Loading $# component module(s) from ${SETUP_BASE}/setup"
+  else
+    msg="Fetching $# component module(s) from ${SETUP_BASE}"
+  fi
+  spin "$msg" fetch_modules "$@" \
+    || die "Could not load module: $(cat "$MODULE_DIR/.failed" 2>/dev/null || echo unknown)"
+  for name in "$@"; do
+    path="$MODULE_DIR/$name.sh"
+    verify_module "$name" "$path"
+    # shellcheck disable=SC1090
+    . "$path"
+    declare -F "fn_${name}" >/dev/null || die "Module '$name' did not define fn_${name}."
+  done
 }
 
 # =============================================================================
@@ -867,79 +1080,16 @@ apt_lock_held() {
   return 1
 }
 
-preflight() {
-  CURRENT_STEP="preflight"
-
-  [ "$(id -u)" -eq 0 ] || die "Must run as root:  sudo ./setup.sh"
-
-  detect_os
-
-  case "$ARCH" in
-    amd64|arm64|x86_64|aarch64) ;;
-    *) warn "Architecture '$ARCH' is unusual; Docker and Dokploy images may not exist for it." ;;
-  esac
-
-  banner
-
-  if [ -f /.dockerenv ] || grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then
-    warn "Running inside a container. Dokploy's installer refuses Docker containers and swarm may misbehave."
-  fi
-
-  # Basic connectivity check; a clear message here beats a confusing apt error.
-  if ! run_sh "getent hosts deb.debian.org >/dev/null 2>&1 || getent hosts archive.ubuntu.com >/dev/null 2>&1"; then
-    warn "DNS lookups for the distribution mirrors failed. Network problems are likely."
-  fi
-
-  wait_for_system_ready
-}
-
-banner() {
-  local mem_total disk_free
-  mem_total="$(awk '/MemTotal/ {printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")"
-  disk_free="$(df -h / | awk 'NR==2 {print $4 " free of " $2}' 2>/dev/null || echo "unknown")"
-
-  # Title and rule share one line; the six facts pack into three rows.
-  local title="${SCRIPT_NAME} v${SCRIPT_VERSION}"
-  local fill=$(( TERM_COLS - ${#title} - 3 ))
-  [ "$fill" -ge 0 ] || fill=0
-  ui ""
-  ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC} ${C_STEP}$(rule_heavy "$fill")${NC}"
-  row "System" "" "$OS_PRETTY ($ARCH) · $(uname -r)"
-  row "Host" "" "$(hostname) · ${mem_total} RAM · ${disk_free}"
-  local target="user ${OPT_USERNAME} · ssh port ${OPT_SSH_PORT}"
-  [ "$OPT_TIMEZONE" = "keep" ] || target="${target} · ${OPT_TIMEZONE}"
-  row "Target" "" "$target"
-  row "Log" "$C_MUTED" "$LOG_FILE"
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    row "Mode" "$C_WARN" "DRY RUN — no changes will be made"
-  fi
-}
-
-# =============================================================================
-# Component: update
-# =============================================================================
-# Timezone, and proof that the clock is actually being disciplined.
-#
-# A wrong clock does not announce itself. It surfaces hours later as TLS
-# handshakes that fail on notBefore, Let's Encrypt refusing to issue, JWTs
-# rejected as expired, and registry auth failing - none of which point at the
+# Proof that the clock is being disciplined, before the first apt call and the
+# first TLS handshake. A wrong clock does not announce itself: apt rejects
+# Release files as "not valid yet", TLS fails on notBefore, Let's Encrypt
+# refuses to issue, JWTs are rejected as expired - none of which point at the
 # clock. Minimal and container-derived images ship with time sync off far more
-# often than you would expect, so it is worth confirming rather than assuming.
-configure_clock() {
-  if [ -n "$OPT_TIMEZONE" ] && [ "$OPT_TIMEZONE" != "keep" ]; then
-    local current
-    current="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
-    if [ "$current" = "$OPT_TIMEZONE" ]; then
-      detail "Timezone already $OPT_TIMEZONE"
-    elif [ ! -f "/usr/share/zoneinfo/$OPT_TIMEZONE" ]; then
-      # tzdata is missing rather than the zone being wrong: --timezone was
-      # validated at startup, so this can only be the UTC default.
-      detail "No zoneinfo on this image; leaving the timezone as ${current:-unknown}"
-    elif run timedatectl set-timezone "$OPT_TIMEZONE"; then
-      ok "Timezone set to $OPT_TIMEZONE"
-    else
-      warn "Could not set the timezone to $OPT_TIMEZONE."
-    fi
+# often than you would expect, so it is confirmed rather than assumed.
+ensure_clock() {
+  if in_container; then
+    detail "Container detected; the clock belongs to the host"
+    return 0
   fi
 
   [ "$OPT_DRY_RUN" -eq 0 ] || { detail "Would verify time synchronisation"; return 0; }
@@ -972,1174 +1122,90 @@ configure_clock() {
   fi
 }
 
-fn_update() {
-  step "System update"
+# Packages the run cannot start without, installed ahead of every component so
+# even a --only=bun run has them. curl fetched this script so it is normally
+# present; unzip is missing from most minimal images and is required before
+# anything else runs (the Bun installer, for one, refuses without it).
+bootstrap_packages() {
+  local -a missing=()
+  have curl  || missing+=(curl)
+  have unzip || missing+=(unzip)
+  [ -f /etc/ssl/certs/ca-certificates.crt ] || missing+=(ca-certificates)
 
-  configure_clock
-
-  if [ -n "$OPT_HOSTNAME" ] && [ "$OPT_HOSTNAME" != "$(hostname)" ]; then
-    run hostnamectl set-hostname "$OPT_HOSTNAME"
-    # Keep /etc/hosts consistent so sudo does not stall on name resolution.
-    if ! grep -qE "^127\.0\.1\.1[[:space:]]+$OPT_HOSTNAME\b" /etc/hosts 2>/dev/null; then
-      run_sh "printf '127.0.1.1\t%s\n' '$OPT_HOSTNAME' >> /etc/hosts"
-    fi
-    ok "Hostname set to $OPT_HOSTNAME"
+  if [ ${#missing[@]} -eq 0 ]; then
+    detail "Prerequisites present (curl, unzip, ca-certificates)"
+    return 0
   fi
-
-  apt_update || die "apt-get update failed. Check network and mirror configuration."
-
-  # Ubuntu ships some updates to a percentage of machines at a time and holds
-  # them back everywhere else. On a host being deliberately brought fully up to
-  # date, "not in the rollout cohort yet" is not a useful reason to skip a
-  # package, so opt in to the phased ones too. Inert on Debian, which does not
-  # phase updates at all.
-  local upgrade_opts=("${APT_OPTS[@]}" -o APT::Get::Always-Include-Phased-Updates=true)
-
-  # Simulate the command that actually runs. "apt-get upgrade" never installs
-  # or removes a package, so on any host with a pending kernel or a changed
-  # dependency it simulates zero work while dist-upgrade has plenty. Counting
-  # with one and running the other is how this step used to report "already up
-  # to date" and skip the upgrade on precisely the machines that needed it.
-  local pending
-  pending="$(apt-get -s dist-upgrade "${upgrade_opts[@]}" 2>/dev/null | grep -c '^Inst ' || true)"
-  if [ "${pending:-0}" -gt 0 ]; then
-    detail "$pending package(s) to upgrade"
-  fi
-
-  # Run it whatever the count says. The simulation is a report, not a gate: it
-  # can still disagree with the real resolver, and a dist-upgrade with nothing
-  # to do costs about a second.
-  run_spin "Upgrading packages (this can take several minutes)" \
-    retry apt-get dist-upgrade "${upgrade_opts[@]}" \
-    || die "Package upgrade failed. See $LOG_FILE"
-
-  if [ "${pending:-0}" -gt 0 ]; then
-    ok "System packages upgraded"
-  else
-    ok "System already up to date"
-  fi
-
-  run apt-get autoremove "${APT_OPTS[@]}" || true
-
-  if [ -f /var/run/reboot-required ]; then
-    warn "A reboot is required to finish applying kernel or library updates."
-  fi
-}
-
-# =============================================================================
-# Component: base
-# =============================================================================
-fn_base() {
-  step "Base packages"
-
-  # iproute2 provides ss, which Dokploy's installer uses for its port checks.
-  # openssh-client provides ssh -Q, used to pick supported SSH algorithms.
   apt_ensure_lists || die "apt-get update failed. Check network and mirror configuration."
-
-  local pkgs=(
-    ca-certificates curl wget gnupg lsb-release apt-transport-https
-    git unzip tar jq
-    iproute2 net-tools dnsutils psmisc
-    openssh-server openssh-client
-    sudo ufw
-    htop rsync
-  )
-
-  apt_install "base packages (${#pkgs[@]})" "${pkgs[@]}" || die "Failed to install base packages. See $LOG_FILE"
-  ok "Base packages installed"
+  apt_install "prerequisites (${missing[*]})" "${missing[@]}" \
+    || die "Could not install ${missing[*]}. See: ${LOG_HINT}"
+  ok "Prerequisites installed: ${missing[*]}"
 }
 
-# =============================================================================
-# Component: ssh
-#
-# Scope is deliberately narrow: create the login account, append a public key
-# if one was supplied, and set the listening port. Authentication directives -
-# PasswordAuthentication, PermitRootLogin, AllowUsers, AuthenticationMethods -
-# are never written, because getting any of them wrong on an unattended run
-# locks the host out with nobody at the console to undo it. Port is the one
-# exception: it cannot deny a login on its own, and the firewall step needs to
-# agree with it.
-# =============================================================================
-SSH_USER_HOME=""
+preflight() {
+  CURRENT_STEP="preflight"
 
-ssh_resolve_home() {
-  SSH_USER_HOME="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
-  if [ -z "$SSH_USER_HOME" ]; then
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-      SSH_USER_HOME="/home/$OPT_USERNAME"
-      return 0
-    fi
-    die "Could not resolve the home directory of '$OPT_USERNAME'."
-  fi
-}
+  [ "$(id -u)" -eq 0 ] || die "Must run as root:  sudo ./setup.sh"
 
-ssh_create_user() {
-  if [ "$OPT_USERNAME" = "root" ]; then
-    ssh_resolve_home
-    return 0
+  detect_os
+
+  case "$ARCH" in
+    amd64|arm64|x86_64|aarch64) ;;
+    *) warn "Architecture '$ARCH' is unusual; Docker and Dokploy images may not exist for it." ;;
+  esac
+
+  banner
+
+  # A Proxmox CT is a normal target, so a container is a note, not a warning.
+  # Docker is the exception: Dokploy's installer refuses to run inside one.
+  if [ -f /.dockerenv ]; then
+    warn "Running inside a Docker container. Dokploy's installer refuses these and swarm may misbehave."
+  elif in_container; then
+    detail "Container detected ($(systemd-detect-virt --container 2>/dev/null || echo unknown)); host-owned settings will be skipped"
   fi
 
-  if id -u "$OPT_USERNAME" >/dev/null 2>&1; then
-    ok "User '$OPT_USERNAME' already exists"
-  else
-    run useradd --create-home --shell /bin/bash "$OPT_USERNAME" \
-      || die "Failed to create user '$OPT_USERNAME'."
-    ok "Created user '$OPT_USERNAME'"
+  # Basic connectivity check; a clear message here beats a confusing apt error.
+  if ! run_sh "getent hosts deb.debian.org >/dev/null 2>&1 || getent hosts archive.ubuntu.com >/dev/null 2>&1"; then
+    warn "DNS lookups for the distribution mirrors failed. Network problems are likely."
   fi
 
-  # No password is ever set, so login is key-only. sudo therefore has to be
-  # passwordless or the account could not administer anything.
-  run usermod -aG sudo "$OPT_USERNAME" || true
-  local sudoers="/etc/sudoers.d/90-${OPT_USERNAME}-init"
-  write_file "$sudoers" 0440 "$OPT_USERNAME ALL=(ALL) NOPASSWD:ALL" || true
-  if [ "$OPT_DRY_RUN" -eq 0 ] && [ -f "$sudoers" ]; then
-    if have visudo; then
-      if ! visudo -cf "$sudoers" >>"$LOG_FILE" 2>&1; then
-        run rm -f "$sudoers"
-        die "The generated sudoers file was rejected by visudo and has been removed."
-      fi
-    else
-      warn "visudo is unavailable, so the sudoers drop-in could not be validated."
-    fi
+  wait_for_system_ready
+  ensure_clock
+
+  # Read-only, so a wrong URL or a stale module aborts with the machine
+  # untouched. Then the prerequisites, ahead of every component.
+  load_modules "${TO_RUN[@]}"
+  bootstrap_packages
+}
+
+banner() {
+  local mem_total disk_free
+  mem_total="$(awk '/MemTotal/ {printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")"
+  disk_free="$(df -h / | awk 'NR==2 {print $4 " free of " $2}' 2>/dev/null || echo "unknown")"
+
+  # Title and rule share one line; the facts pack into a few rows.
+  local title="${SCRIPT_NAME} v${SCRIPT_VERSION}"
+  local fill=$(( TERM_COLS - ${#title} - 3 ))
+  [ "$fill" -ge 0 ] || fill=0
+  ui ""
+  ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC} ${C_STEP}$(rule_heavy "$fill")${NC}"
+  row "System" "" "$OS_PRETTY ($ARCH) · $(uname -r)"
+  row "Host" "" "$(hostname) · ${mem_total} RAM · ${disk_free}"
+  local target="user ${OPT_USERNAME} · ssh port ${OPT_SSH_PORT}"
+  [ "$OPT_TIMEZONE" = "keep" ] || target="${target} · ${OPT_TIMEZONE}"
+  row "Target" "" "$target"
+  row "Modules" "$C_MUTED" "$SETUP_BASE"
+  row "Log" "$C_MUTED" "$LOG_HINT"
+  if [ ${#SKIPPED[@]} -gt 0 ]; then
+    local skip_list="" name
+    for name in "${SKIPPED[@]}"; do
+      if [ -z "$skip_list" ]; then skip_list="$name"; else skip_list="${skip_list} · ${name}"; fi
+    done
+    row "Skipped" "$C_MUTED" "$skip_list"
   fi
-  ok "Passwordless sudo configured for '$OPT_USERNAME'"
-
-  ssh_resolve_home
-}
-
-ssh_authorized_keys_path() {
-  printf '%s/.ssh/authorized_keys' "$SSH_USER_HOME"
-}
-
-ssh_count_keys() {
-  local f n
-  f="$(ssh_authorized_keys_path)"
-  [ -f "$f" ] || { echo 0; return 0; }
-  # grep -c prints 0 and exits 1 when nothing matches, so swallow the status
-  # instead of appending a second line of output.
-  n="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || true)"
-  echo "${n:-0}"
-}
-
-ssh_install_pubkey() {
-  local pubkey="$1"
-  local dir="$SSH_USER_HOME/.ssh"
-  local file="$dir/authorized_keys"
-
   if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would install public key into $file"
-    return 0
+    row "Mode" "$C_WARN" "DRY RUN — no changes will be made"
   fi
-
-  install -d -m 700 -o "$OPT_USERNAME" -g "$(id -gn "$OPT_USERNAME")" "$dir"
-  touch "$file"
-  chmod 600 "$file"
-  chown "$OPT_USERNAME:$(id -gn "$OPT_USERNAME")" "$file"
-
-  if grep -qxF "$pubkey" "$file" 2>/dev/null; then
-    detail "Public key already present in authorized_keys"
-  else
-    printf '%s\n' "$pubkey" >>"$file"
-  fi
-}
-
-# Appends a supplied public key, or leaves whatever is already there alone.
-# Nothing here can remove an existing key or refuse a login, so there is no
-# failure mode that costs access.
-ssh_setup_keys() {
-  local existing
-  existing="$(ssh_count_keys)"
-
-  if [ -n "$OPT_PUBKEY" ]; then
-    ssh_install_pubkey "$OPT_PUBKEY"
-    SSH_KEY_SOURCE="provided"
-    ok "Installed the supplied public key for '$OPT_USERNAME'"
-    return 0
-  fi
-
-  if [ "$existing" -gt 0 ]; then
-    SSH_KEY_SOURCE="existing"
-    ok "'$OPT_USERNAME' already has $existing authorized key(s); keeping them"
-    return 0
-  fi
-
-  SSH_KEY_SOURCE="none"
-  detail "No authorized keys for '$OPT_USERNAME' and no --pubkey given; leaving authentication as it is"
-  return 0
-}
-
-# Port is the only directive this script owns, and it is the only one commented
-# out elsewhere. sshd keeps the first value it finds, so a cloud image shipping
-# /etc/ssh/sshd_config.d/50-cloud-init.conf with its own Port would otherwise
-# silently win. Every other directive in those files is left exactly as it is.
-ssh_neutralise_conflicts() {
-  local ours="$1"
-  local directives='Port'
-  local f
-  for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-    [ -f "$f" ] || continue
-    [ "$f" = "$ours" ] && continue
-    if grep -qE "^[[:space:]]*($directives)[[:space:]]" "$f"; then
-      backup_file "$f"
-      run sed -i -E "s~^[[:space:]]*($directives)[[:space:]]~# disabled by setup.sh: \\1 ~" "$f"
-      detail "Neutralised overlapping directives in $f"
-    fi
-  done
-}
-
-ssh_ensure_include() {
-  local main=/etc/ssh/sshd_config
-  if [ ! -f "$main" ]; then
-    warn "/etc/ssh/sshd_config is missing; is openssh-server installed?"
-    return 0
-  fi
-  grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$main" 2>/dev/null && return 0
-  backup_file "$main"
-  if [ "$OPT_DRY_RUN" -eq 0 ]; then
-    printf 'Include /etc/ssh/sshd_config.d/*.conf\n\n' | cat - "$main" >"${main}.new"
-    mv "${main}.new" "$main"
-    chmod 644 "$main"
-  fi
-  detail "Added the sshd_config.d Include directive"
-}
-
-# Ubuntu 24.04 and Debian 13 start sshd through ssh.socket, where the Port
-# directive in sshd_config is ignored entirely. The listening port has to be
-# changed on the socket unit instead.
-ssh_apply_socket_port() {
-  systemctl list-unit-files ssh.socket >/dev/null 2>&1 || return 0
-  systemctl is-enabled ssh.socket >/dev/null 2>&1 || return 0
-
-  local dir=/etc/systemd/system/ssh.socket.d
-  local content
-  content="$(printf '[Socket]\nListenStream=\nListenStream=%s' "$OPT_SSH_PORT")"
-  write_file "$dir/10-port.conf" 0644 "$content" || true
-  run systemctl daemon-reload
-  detail "ssh.socket configured to listen on port $OPT_SSH_PORT"
-  return 0
-}
-
-ssh_restart() {
-  local unit="ssh"
-  systemctl list-unit-files ssh.service >/dev/null 2>&1 || unit="sshd"
-
-  if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
-    run systemctl restart ssh.socket || warn "Could not restart ssh.socket."
-    run systemctl restart "$unit" || true
-  else
-    run systemctl restart "$unit" || die "sshd failed to restart. Existing sessions stay open; fix the config before disconnecting."
-  fi
-
-  # Existing sessions survive a restart, so a failure here is recoverable, but
-  # it must be loud.
-  if [ "$OPT_DRY_RUN" -eq 0 ] && ! systemctl is-active --quiet "$unit" \
-     && ! systemctl is-active --quiet ssh.socket; then
-    die "sshd is not running after the restart. Do not close this session; see $LOG_FILE"
-  fi
-}
-
-# sshd -t can fail for reasons that have nothing to do with this configuration
-# (a broken host key, a bad directive someone else left behind). Rejecting our
-# drop-in in that case would silently discard the hardening, so when validation
-# fails the baseline is tested too and only a genuine regression is fatal.
-validate_sshd_config() {
-  local ours="$1" err
-
-  if err="$(sshd -t 2>&1)"; then
-    detail "sshd configuration validated"
-    return 0
-  fi
-
-  log "sshd -t failed with our drop-in: $err"
-  mv "$ours" "${ours}.rejected"
-
-  local baseline_err
-  if baseline_err="$(sshd -t 2>&1)"; then
-    # The baseline is fine, so the fault is ours. Leave SSH untouched.
-    rm -f "${ours}.rejected"
-    die "The generated sshd configuration was rejected: ${err}. It has been removed and SSH is unchanged."
-  fi
-
-  # The baseline is broken too, so this is pre-existing and not something the
-  # drop-in caused. Keep the hardening and make the real problem visible.
-  mv "${ours}.rejected" "$ours"
-  warn "sshd reports a pre-existing problem: ${baseline_err}"
-  warn "The hardening was applied anyway. Fix the above before relying on it."
-  return 0
-}
-
-fn_ssh() {
-  step "SSH access"
-
-  ssh_create_user
-  ssh_setup_keys
-
-  local ours=/etc/ssh/sshd_config.d/00-server-init.conf
-  ssh_ensure_include
-  ssh_neutralise_conflicts "$ours"
-
-  # One directive. Everything this file used to set - PermitRootLogin,
-  # PasswordAuthentication, AllowUsers, AuthenticationMethods, MaxAuthTries,
-  # the KexAlgorithms/Ciphers/MACs lists - is gone on purpose. Any of them can
-  # refuse a login, and an unattended run has nobody to notice.
-  local content
-  content="$(cat <<CONF
-# Managed by setup.sh (Server Initialization Suite) — do not edit by hand.
-# Generated $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-#
-# This file sorts first inside sshd_config.d on purpose: sshd keeps the first
-# value it sees for a directive, so nothing later can move the port back.
-#
-# Port is the only setting managed here. Authentication is left to the system's
-# own configuration.
-
-Port $OPT_SSH_PORT
-CONF
-)"
-
-  backup_file "$ours"
-  write_file "$ours" 0644 "$content" || true
-
-  if [ "$OPT_DRY_RUN" -eq 0 ]; then
-    # sshd -t needs the privilege separation directory, which normally only
-    # exists once sshd has run at least once.
-    mkdir -p /run/sshd
-    validate_sshd_config "$ours"
-  fi
-
-  ssh_apply_socket_port
-  ssh_restart
-
-  ok "sshd listening on port $OPT_SSH_PORT (authentication left unchanged)"
-
-  if [ "$OPT_SSH_PORT" != "22" ]; then
-    warn "SSH now listens on port $OPT_SSH_PORT. Verify a new session works before closing this one."
-  fi
-}
-
-# =============================================================================
-# Component: firewall
-# =============================================================================
-fn_firewall() {
-  step "Firewall (UFW)"
-
-  if ! have ufw; then
-    apt_ensure_lists || true
-    apt_install "ufw" ufw || die "Could not install ufw."
-  fi
-
-  if [ "$OPT_RESET_FIREWALL" -eq 1 ]; then
-    run_sh "ufw --force reset"
-    warn "Existing UFW rules were wiped by --reset-firewall."
-  fi
-
-  run_sh "ufw default deny incoming"
-  run_sh "ufw default allow outgoing"
-
-  # Allow SSH before enabling; ufw limit also rate-limits repeat connections.
-  run_sh "ufw limit ${OPT_SSH_PORT}/tcp comment 'SSH'"
-  ok "SSH allowed and rate-limited on ${OPT_SSH_PORT}/tcp"
-
-  if is_enabled dokploy; then
-    run_sh "ufw allow 80/tcp comment 'HTTP (Traefik)'"
-    run_sh "ufw allow 443/tcp comment 'HTTPS (Traefik)'"
-    run_sh "ufw allow 443/udp comment 'HTTP/3 (Traefik)'"
-    # 3000 is the admin UI, not application traffic, so it is not opened just
-    # because Dokploy is being installed. --ui-public opts into that.
-    if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
-      run_sh "ufw allow 3000/tcp comment 'Dokploy UI (--ui-public)'"
-      ok "Opened 80/tcp, 443/tcp, 443/udp and 3000/tcp for Dokploy"
-    else
-      run_sh "ufw delete allow 3000/tcp" || true
-      ok "Opened 80/tcp, 443/tcp and 443/udp for Dokploy"
-    fi
-  fi
-
-  run_sh "ufw --force enable"
-  ok "UFW enabled"
-
-  # This is not a footnote. Docker inserts its own iptables rules ahead of
-  # UFW's, so a published container port is reachable even when UFW claims to
-  # deny it. The --ui-allow handling below is what actually restricts port 3000.
-  # Stated as a detail, not a warning: it is true of every Docker host and
-  # nothing about this run made it so. The warning that matters - port 3000
-  # being open to the internet - is raised by the Dokploy step itself.
-  detail "Docker publishes container ports around UFW; published ports stay open"
-}
-
-# =============================================================================
-# Component: fail2ban
-# =============================================================================
-fn_fail2ban() {
-  step "fail2ban"
-
-  # python3-systemd is required for the systemd backend. Ubuntu 24.04 and
-  # Debian 12 no longer guarantee /var/log/auth.log exists, so the file backend
-  # fails at startup; reading the journal instead is the reliable option.
-  apt_ensure_lists || true
-  apt_install "fail2ban" fail2ban python3-systemd || die "Could not install fail2ban."
-
-  local jail=/etc/fail2ban/jail.local
-  local content
-  content="$(cat <<CONF
-# Managed by setup.sh (Server Initialization Suite).
-
-[DEFAULT]
-# Read the systemd journal rather than /var/log/auth.log, which does not exist
-# on distributions that ship without rsyslog.
-backend = systemd
-
-bantime  = 1h
-findtime = 10m
-maxretry = 4
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled  = true
-port     = $OPT_SSH_PORT
-maxretry = 3
-bantime  = 1h
-
-[recidive]
-# Hosts that keep coming back after a ban get a much longer one.
-enabled  = true
-backend  = systemd
-logpath  = /var/log/fail2ban.log
-bantime  = 1w
-findtime = 1d
-maxretry = 5
-CONF
-)"
-
-  write_file "$jail" 0644 "$content" || true
-
-  # The recidive jail reads fail2ban's own log file, so it must exist.
-  run touch /var/log/fail2ban.log
-
-  run systemctl enable fail2ban || true
-  if run systemctl restart fail2ban; then
-    ok "fail2ban active, watching SSH on port $OPT_SSH_PORT"
-  else
-    warn "fail2ban failed to start. See 'journalctl -u fail2ban' and $LOG_FILE"
-  fi
-}
-# =============================================================================
-# Component: hardening
-# =============================================================================
-fn_hardening() {
-  step "Kernel and log hardening"
-
-  harden_sysctl
-  cap_journal
-  lock_root_password
-}
-
-# Network-stack settings that are safe on a Docker host.
-#
-# Two deliberate omissions. net.ipv4.ip_forward is not touched: Docker turns it
-# on for itself, and a file here setting it to 0 would silently break every
-# container's networking on the next boot. rp_filter is set to 2 (loose) rather
-# than 1 (strict), because strict mode drops the asymmetric return traffic that
-# Swarm's ingress mesh and multi-homed hosts legitimately produce; loose mode
-# still discards obviously spoofed source addresses.
-harden_sysctl() {
-  local conf
-  conf="$(cat <<'CONF'
-# Managed by setup.sh (Server Initialization Suite).
-# Deliberately absent: net.ipv4.ip_forward - Docker manages it.
-
-# SYN flood mitigation.
-net.ipv4.tcp_syncookies = 1
-
-# Loose reverse-path filtering. Strict (1) breaks Docker Swarm ingress.
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-
-# Ignore anything that tries to rewrite this host's routing table.
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-
-# This host is not a router.
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-
-# Source routing lets a caller choose the return path. Nothing legitimate does.
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
-
-# Do not answer broadcast pings, do not trust forged ICMP errors.
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# Do not hand kernel addresses to unprivileged readers.
-kernel.kptr_restrict = 2
-
-# Classic /tmp symlink and hardlink races.
-fs.protected_symlinks = 1
-fs.protected_hardlinks = 1
-CONF
-)"
-
-  if write_file /etc/sysctl.d/99-server-init-hardening.conf 0644 "$conf"; then
-    if run sysctl --system; then
-      ok "Kernel network hardening applied"
-    else
-      warn "Some sysctl settings were rejected by this kernel; see $LOG_FILE"
-    fi
-  else
-    detail "Kernel hardening already in place"
-  fi
-}
-
-# Container logs are already capped in daemon.json, but the journal is not. Its
-# default ceiling is a share of the filesystem, so on a large disk it will grow
-# into tens of gigabytes of logs nobody reads before anything stops it.
-cap_journal() {
-  local conf
-  conf="$(cat <<'CONF'
-# Managed by setup.sh (Server Initialization Suite).
-[Journal]
-SystemMaxUse=500M
-SystemMaxFileSize=50M
-SystemKeepFree=1G
-MaxRetentionSec=1month
-CONF
-)"
-
-  if write_file /etc/systemd/journald.conf.d/99-server-init.conf 0644 "$conf"; then
-    run systemctl restart systemd-journald || warn "Could not restart systemd-journald."
-    ok "Journal capped at 500 MB, one month retention"
-  else
-    detail "Journal limits already in place"
-  fi
-}
-
-# Disabling root's SSH login leaves its password untouched, so a console, a
-# rescue shell or a serial port is still a password prompt. Only lock it once
-# the replacement account is demonstrably usable, and never when root is the
-# account being configured.
-lock_root_password() {
-  if [ "$OPT_USERNAME" = "root" ]; then
-    detail "Root is the login account; leaving its password alone"
-    return 0
-  fi
-
-  local home keys=0
-  home="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
-  if [ -n "$home" ] && [ -f "$home/.ssh/authorized_keys" ]; then
-    keys="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$home/.ssh/authorized_keys" 2>/dev/null || true)"
-  fi
-  if [ "${keys:-0}" -lt 1 ]; then
-    detail "'$OPT_USERNAME' has no authorized keys yet; leaving root's password alone"
-    return 0
-  fi
-
-  if [ "$(passwd -S root 2>/dev/null | awk '{print $2}')" = "L" ]; then
-    detail "Root password already locked"
-    return 0
-  fi
-
-  if run passwd -l root; then
-    ok "Root password locked; '$OPT_USERNAME' with sudo is the only way in"
-  else
-    warn "Could not lock the root password."
-  fi
-}
-
-
-# =============================================================================
-# Component: swap
-#
-# Small VPS instances routinely run out of memory during container builds. A
-# swapfile is the cheapest fix and costs nothing when unused.
-# =============================================================================
-fn_swap() {
-  step "Swap"
-
-  local existing
-  existing="$(swapon --show --noheadings 2>/dev/null | wc -l)"
-  if [ "${existing:-0}" -gt 0 ]; then
-    ok "Swap already configured; leaving it alone"
-    return 0
-  fi
-
-  local mem_mb size_mb
-  mem_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
-  if [ "$mem_mb" -ge 8192 ]; then
-    ok "${mem_mb} MB of RAM; no swapfile needed"
-    return 0
-  fi
-  size_mb=$((mem_mb < 2048 ? 2048 : mem_mb))
-
-  local avail_mb
-  avail_mb="$(df --output=avail -m / | tail -n1 | tr -d ' ')"
-  if [ "$avail_mb" -lt $((size_mb + 2048)) ]; then
-    warn "Not enough free disk space for a ${size_mb} MB swapfile; skipping."
-    return 0
-  fi
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would create a ${size_mb} MB swapfile at /swapfile"
-    return 0
-  fi
-
-  run_spin "Creating a ${size_mb} MB swapfile" \
-    bash -c "fallocate -l ${size_mb}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=${size_mb}"
-  run chmod 600 /swapfile
-
-  # Swap is a convenience, not a dependency. A filesystem that refuses
-  # swapfiles must not abort the rest of the run.
-  if ! run mkswap /swapfile || ! run swapon /swapfile; then
-    run rm -f /swapfile
-    warn "This filesystem refused a swapfile; continuing without swap."
-    return 0
-  fi
-
-  grep -qE '^/swapfile\b' /etc/fstab || run_sh "printf '/swapfile none swap sw 0 0\n' >> /etc/fstab"
-  if write_file /etc/sysctl.d/99-swap.conf 0644 "vm.swappiness = 10
-vm.vfs_cache_pressure = 50"; then
-    run sysctl --system || warn "Could not apply the swappiness settings."
-  fi
-
-  ok "${size_mb} MB swapfile active"
-}
-
-# =============================================================================
-# Component: docker
-#
-# Docker is installed from Docker's own apt repository rather than left to
-# Dokploy's installer, which pins an exact version and apt-mark holds it.
-# Installing it first means Dokploy detects Docker and skips that entirely.
-# =============================================================================
-fn_docker() {
-  step "Docker"
-
-  # Legacy packages conflict with docker-ce and must go first.
-  local legacy=(docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc)
-  local installed=()
-  local p
-  for p in "${legacy[@]}"; do
-    if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "^install ok installed"; then
-      installed+=("$p")
-    fi
-  done
-  if [ ${#installed[@]} -gt 0 ]; then
-    detail "Removing conflicting packages: ${installed[*]}"
-    run apt-get remove "${APT_OPTS[@]}" "${installed[@]}" || true
-  fi
-
-  if have docker && docker version >/dev/null 2>&1; then
-    ok "Docker already installed: $(docker --version 2>/dev/null || echo unknown)"
-  else
-    local repo_os="$OS_ID"
-    case "$OS_ID" in
-      debian|ubuntu) ;;
-      *) repo_os="debian"; case " ${ID_LIKE:-} " in *ubuntu*) repo_os="ubuntu" ;; esac ;;
-    esac
-
-    run install -m 0755 -d /etc/apt/keyrings
-    run_spin "Fetching the Docker signing key" \
-      retry curl -fsSL --connect-timeout 15 "https://download.docker.com/linux/${repo_os}/gpg" \
-      -o /etc/apt/keyrings/docker.asc \
-      || die "Could not download the Docker GPG key."
-    run chmod a+r /etc/apt/keyrings/docker.asc
-
-    write_file /etc/apt/sources.list.d/docker.list 0644 \
-      "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${repo_os} ${OS_CODENAME} stable" || true
-    # Remove the deb822 file a previous version of this script may have written.
-    run rm -f /etc/apt/sources.list.d/docker.sources
-
-    apt_update || die "apt-get update failed after adding the Docker repository."
-    apt_install "Docker Engine" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-      || die "Docker installation failed. See $LOG_FILE"
-    ok "Docker installed: $(docker --version 2>/dev/null || echo unknown)"
-  fi
-
-  # Unbounded container logs are a classic way for an unattended server to fill
-  # its disk months later.
-  configure_docker_daemon
-
-  run systemctl enable docker || true
-  run systemctl start docker || die "Docker failed to start."
-
-  if [ "$OPT_USERNAME" != "root" ]; then
-    run usermod -aG docker "$OPT_USERNAME" || true
-    detail "'$OPT_USERNAME' added to the docker group (effective at next login)"
-  fi
-}
-
-configure_docker_daemon() {
-  local f=/etc/docker/daemon.json
-  local desired='{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "20m",
-    "max-file": "5"
-  },
-  "live-restore": false
-}'
-
-  if [ ! -f "$f" ]; then
-    write_file "$f" 0644 "$desired" && detail "Container log rotation configured"
-    return 0
-  fi
-
-  # An existing daemon.json is merged rather than replaced, so Dokploy's or the
-  # operator's own settings survive a re-run.
-  if have jq && [ "$OPT_DRY_RUN" -eq 0 ]; then
-    local merged
-    if merged="$(jq -s '.[0] * .[1]' "$f" <(printf '%s' "$desired") 2>/dev/null)" && [ -n "$merged" ]; then
-      if [ "$merged" != "$(cat "$f")" ]; then
-        backup_file "$f"
-        printf '%s\n' "$merged" >"$f"
-        run systemctl restart docker || warn "Docker did not restart cleanly after the daemon.json update."
-        detail "Merged log rotation settings into the existing daemon.json"
-      fi
-      return 0
-    fi
-  fi
-  warn "Left the existing /etc/docker/daemon.json untouched; container log rotation not applied."
-}
-
-# =============================================================================
-# Component: dokploy
-# =============================================================================
-dokploy_is_installed() {
-  have docker || return 1
-  docker info 2>/dev/null | grep -q 'Swarm: active' || return 1
-  [ -n "$(docker service ls --filter name=dokploy --quiet 2>/dev/null)" ]
-}
-
-# Dokploy's installer aborts if anything holds 80, 443 or 3000. Reporting which
-# process holds the port is far more useful than its bare error message.
-dokploy_check_ports() {
-  local port busy=0
-  for port in 80 443 3000; do
-    if ss -tulnp 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
-      local holder
-      holder="$(ss -tulnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -n1 | sed 's/.*users:((//' | cut -d, -f1 | tr -d '("')"
-      warn "Port ${port} is already in use by: ${holder:-unknown}"
-      busy=1
-    fi
-  done
-  return $busy
-}
-
-fn_dokploy() {
-  step "Dokploy"
-
-  if ! have docker; then
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-      detail "Would install Dokploy once Docker is present"
-      return 0
-    fi
-    warn "Docker is not installed, so Dokploy cannot be installed. Re-run without --exclude=docker."
-    return 0
-  fi
-
-  if dokploy_is_installed; then
-    if [ "$OPT_REINSTALL_DOKPLOY" -eq 0 ]; then
-      ok "Dokploy is already installed; leaving it untouched"
-      detail "Re-running the installer would leave and re-initialise Docker Swarm"
-      detail "Use --reinstall-dokploy to force it, or 'dokploy update' to upgrade"
-      DOKPLOY_INSTALLED=1
-      restrict_dokploy_ui
-      return 0
-    fi
-    warn "Reinstalling Dokploy: Docker Swarm will be left and re-initialised."
-    detail "Removing the existing Dokploy services so the ports are free"
-    run docker service rm dokploy dokploy-postgres || true
-    run docker rm -f dokploy-traefik || true
-    sleep 5
-  fi
-
-  if ! dokploy_check_ports; then
-    warn "Skipping Dokploy because required ports are occupied. Free 80, 443 and 3000, then re-run with --only=dokploy."
-    return 0
-  fi
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    # Deliberately does not set DOKPLOY_INSTALLED: the summary reports what is
-    # on the machine, and a dry run installs nothing.
-    detail "Would run the Dokploy installer"
-    return 0
-  fi
-
-  local installer
-  installer="$(mktemp)"
-  run_spin "Downloading the Dokploy installer" \
-    retry curl -fsSL --connect-timeout 20 https://dokploy.com/install.sh -o "$installer" \
-    || { rm -f "$installer"; die "Could not download the Dokploy installer."; }
-
-  # Sanity check: a captive portal or error page must not be piped into a shell.
-  if ! head -n1 "$installer" | grep -q '^#!'; then
-    rm -f "$installer"
-    die "The downloaded Dokploy installer is not a shell script. Aborting rather than executing it."
-  fi
-
-  info "Running the Dokploy installer (pulls several images; expect 2-5 minutes)"
-  if run_spin "Installing Dokploy" bash "$installer"; then
-    DOKPLOY_INSTALLED=1
-    ok "Dokploy installed"
-  else
-    rm -f "$installer"
-    die "The Dokploy installer failed. See $LOG_FILE"
-  fi
-  rm -f "$installer"
-
-  wait_for_dokploy
-  restrict_dokploy_ui
-}
-
-# The swarm service needs a moment to pull and start. Confirming the UI answers
-# turns a silent half-finished install into a visible warning.
-wait_for_dokploy() {
-  local waited=0
-  while [ $waited -lt 90 ]; do
-    if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:3000 2>/dev/null; then
-      ok "Dokploy UI responding on port 3000"
-      return 0
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-  warn "Dokploy did not answer on port 3000 within 90s. Check 'docker service ls' and 'docker service logs dokploy'."
-  return 0
-}
-
-# Restrict the Dokploy UI to specific sources.
-#
-# UFW cannot do this: Docker's iptables rules run first. The rule has to live in
-# the DOCKER-USER chain, and is re-applied at boot by a systemd unit because
-# iptables rules do not persist.
-# Port 3000 is closed to the internet unless somebody asks for it.
-#
-# The first visitor to reach an unclaimed Dokploy UI becomes its administrator,
-# which makes "reachable by default" the wrong default at any scale: the window
-# between this script finishing and a human logging in is exactly the window an
-# internet-wide scanner needs. Loopback is unaffected either way - a published
-# port reached over 127.0.0.1 never traverses the FORWARD chain - so an SSH
-# tunnel still works with no rules at all.
-restrict_dokploy_ui() {
-  if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
-    warn "The Dokploy UI on port 3000 is reachable from the whole internet (--ui-public)."
-    detail "Whoever opens it first creates the admin account. Do it now."
-    return 0
-  fi
-
-  local script=/usr/local/sbin/dokploy-ui-firewall
-  local cidrs="$OPT_UI_ALLOW"
-  local body
-  body="$(cat <<SCRIPT
-#!/usr/bin/env bash
-# Managed by setup.sh. Restricts the Dokploy UI (port 3000) to allowed sources.
-# Docker bypasses UFW, so the rule must sit in the DOCKER-USER chain.
-set -euo pipefail
-
-ALLOW="$cidrs"
-
-iptables -N DOKPLOY-UI 2>/dev/null || iptables -F DOKPLOY-UI
-for cidr in \${ALLOW//,/ }; do
-  iptables -A DOKPLOY-UI -s "\$cidr" -j RETURN
-done
-iptables -A DOKPLOY-UI -j DROP
-
-iptables -C DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI 2>/dev/null \\
-  || iptables -I DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI
-SCRIPT
-)"
-
-  write_file "$script" 0755 "$body" || true
-
-  local unit
-  unit="$(cat <<UNIT
-[Unit]
-Description=Restrict the Dokploy UI port to allowed sources
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$script
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-)"
-  write_file /etc/systemd/system/dokploy-ui-firewall.service 0644 "$unit" || true
-
-  run systemctl daemon-reload
-  run systemctl enable dokploy-ui-firewall.service || true
-  if run systemctl restart dokploy-ui-firewall.service; then
-    if [ -n "$OPT_UI_ALLOW" ]; then
-      ok "Dokploy UI on port 3000 restricted to: $OPT_UI_ALLOW"
-    else
-      ok "Dokploy UI on port 3000 closed to the network"
-      detail "Reach it over an SSH tunnel, the Cloudflare tunnel, or reopen it with:"
-      detail "  sudo ./setup.sh --only=dokploy --ui-allow=<your.ip>/32"
-    fi
-  else
-    warn "Could not apply the port 3000 restriction; the UI may be publicly reachable."
-  fi
-}
-
-# =============================================================================
-# Component: cloudflared
-# =============================================================================
-fn_cloudflared() {
-  step "Cloudflare Tunnel (cloudflared)"
-
-  if have cloudflared; then
-    ok "cloudflared already installed: $(cloudflared --version 2>/dev/null | head -n1 || true)"
-    return 0
-  fi
-
-  run install -m 0755 -d /usr/share/keyrings
-  run_spin "Fetching the Cloudflare signing key" \
-    retry curl -fsSL --connect-timeout 15 https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
-    -o /usr/share/keyrings/cloudflare-public-v2.gpg \
-    || { warn "Could not download the Cloudflare GPG key; skipping cloudflared."; return 0; }
-  run chmod a+r /usr/share/keyrings/cloudflare-public-v2.gpg
-
-  write_file /etc/apt/sources.list.d/cloudflared.list 0644 \
-    "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" || true
-
-  if ! apt_update; then
-    warn "apt-get update failed after adding the Cloudflare repository; skipping cloudflared."
-    return 0
-  fi
-
-  if apt_install "cloudflared" cloudflared; then
-    ok "cloudflared installed: $(cloudflared --version 2>/dev/null | head -n1 || echo unknown)"
-    detail "Connect it with: sudo cloudflared service install <tunnel-token>"
-  else
-    warn "cloudflared installation failed; continuing without it."
-  fi
-}
-
-# =============================================================================
-# Component: bun
-# =============================================================================
-fn_bun() {
-  step "Bun runtime"
-
-  local home="$SSH_USER_HOME"
-  [ -n "$home" ] || home="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
-  [ -n "$home" ] || { warn "Could not resolve a home directory for Bun; skipping."; return 0; }
-
-  if [ -x "$home/.bun/bin/bun" ]; then
-    ok "Bun already installed for '$OPT_USERNAME': $("$home/.bun/bin/bun" --version 2>/dev/null || echo unknown)"
-    return 0
-  fi
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would install Bun into $home/.bun"
-    return 0
-  fi
-
-  if run_spin "Installing Bun for '$OPT_USERNAME'" \
-      runuser -u "$OPT_USERNAME" -- bash -c 'curl -fsSL https://bun.sh/install | bash'; then
-    ok "Bun installed: $("$home/.bun/bin/bun" --version 2>/dev/null || echo unknown)"
-    detail "Available in new shells; run 'source ~/.bashrc' in this one"
-  else
-    warn "Bun installation failed; continuing without it."
-  fi
-}
-
-# =============================================================================
-# Component: unattended-upgrades
-#
-# Runs last, so it can never contend with this script for the apt lock.
-#
-# The configuration deliberately restricts itself to the security pocket, never
-# reboots on its own, and excludes the Docker packages: an automatic Docker or
-# containerd upgrade restarts the daemon underneath running containers.
-# =============================================================================
-fn_unattended() {
-  step "Automatic security updates"
-
-  apt_ensure_lists || true
-  apt_install "unattended-upgrades" unattended-upgrades apt-listchanges || {
-    warn "Could not install unattended-upgrades; skipping."
-    return 0
-  }
-
-  local origins
-  if [ "$OS_ID" = "ubuntu" ]; then
-    # Origins-Pattern entries must be key=value pairs. The shorter
-    # "Ubuntu:noble-security" form belongs to Allowed-Origins, and putting it
-    # here makes unattended-upgrade fail to parse its own configuration.
-    origins='        "origin=Ubuntu,archive=${distro_codename}-security";
-        "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
-        "origin=UbuntuESM,archive=${distro_codename}-infra-security";'
-  else
-    origins='        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";'
-  fi
-
-  # Installing a kernel patch does not activate it. Without a reboot the host
-  # keeps running the vulnerable image indefinitely, and across a fleet nobody
-  # reboots by hand - so the choice is an explicit maintenance window or an
-  # explicit decision to stay on the old kernel.
-  local reboot_policy
-  if [ -n "$OPT_AUTO_REBOOT" ]; then
-    reboot_policy="// Reboot inside the window given by --auto-reboot.
-Unattended-Upgrade::Automatic-Reboot \"true\";
-Unattended-Upgrade::Automatic-Reboot-WithUsers \"true\";
-Unattended-Upgrade::Automatic-Reboot-Time \"${OPT_AUTO_REBOOT}\";"
-  else
-    reboot_policy='// Never reboot on its own; pass --auto-reboot=HH:MM to allow it.
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Automatic-Reboot-WithUsers "false";'
-  fi
-
-  local conf
-  conf="$(cat <<CONF
-// Managed by setup.sh (Server Initialization Suite).
-// Security updates only, Docker left alone.
-
-// #clear discards whatever the shipped 50unattended-upgrades put in these
-// lists, so the effective configuration is exactly what is written below
-// rather than the union of both files. Allowed-Origins is cleared as well:
-// unattended-upgrade merges it with Origins-Pattern, and Ubuntu's default
-// entry for the plain release pocket would let through non-security updates.
-#clear Unattended-Upgrade::Allowed-Origins;
-#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern {
-$origins
-};
-
-// Upgrading these restarts the Docker daemon under running containers.
-#clear Unattended-Upgrade::Package-Blacklist;
-Unattended-Upgrade::Package-Blacklist {
-        "docker-ce";
-        "docker-ce-cli";
-        "containerd.io";
-        "docker-buildx-plugin";
-        "docker-compose-plugin";
-};
-
-$reboot_policy
-
-// Apply upgrades one at a time so an interruption leaves a recoverable state.
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::InstallOnShutdown "false";
-
-// Stop /boot filling up with old kernels, a common cause of later apt failures.
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-
-// Virtual machines report no AC power.
-Unattended-Upgrade::OnlyOnACPower "false";
-Unattended-Upgrade::Skip-Updates-On-Metered-Connections "true";
-
-// Keep the config files that are already on disk.
-Dpkg::Options {
-        "--force-confdef";
-        "--force-confold";
-};
-
-Unattended-Upgrade::SyslogEnable "true";
-CONF
-)"
-
-  write_file /etc/apt/apt.conf.d/52-server-init 0644 "$conf" || true
-
-  local periodic
-  periodic="$(cat <<'CONF'
-// Managed by setup.sh (Server Initialization Suite).
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::AutocleanInterval "7";
-CONF
-)"
-  write_file /etc/apt/apt.conf.d/20auto-upgrades 0644 "$periodic" || true
-
-  if [ "$OPT_DRY_RUN" -eq 0 ]; then
-    if unattended-upgrade --dry-run --debug >>"$LOG_FILE" 2>&1; then
-      detail "Configuration validated with a dry run"
-    else
-      warn "'unattended-upgrades --dry-run' reported a problem; see $LOG_FILE"
-    fi
-  fi
-
-  run systemctl enable --now unattended-upgrades.service || true
-  if [ -n "$OPT_AUTO_REBOOT" ]; then
-    ok "Security updates applied automatically; reboots at ${OPT_AUTO_REBOOT} when needed"
-  else
-    ok "Security updates applied automatically; reboots stay manual"
-    detail "Kernel patches need a reboot; --auto-reboot=HH:MM schedules one"
-  fi
-}
-
-# =============================================================================
-# Component: verify
-#
-# The last chance to notice a lockout while there is still a working shell to
-# fix it from. Everything here is read-only: it proves the door opens rather
-# than assuming the previous steps left it that way.
-# =============================================================================
-fn_verify() {
-  step "Verify access"
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    detail "Would verify sshd, the firewall and the account's authorized_keys"
-    return 0
-  fi
-
-  if run_sh "ss -ltnH 'sport = :${OPT_SSH_PORT}' | grep -q ."; then
-    ok "sshd is listening on port ${OPT_SSH_PORT}"
-  else
-    warn "Nothing is listening on port ${OPT_SSH_PORT}. Do not close this session; check 'systemctl status ssh'."
-  fi
-
-  if have ufw && run_sh "ufw status | grep -qi '^Status: active'"; then
-    detail "UFW active"
-  else
-    detail "UFW not active"
-  fi
-
-  verify_authorized_keys
-}
-
-# Reports on authorized_keys without judging it. Password authentication is
-# whatever the system already had, so an empty file is not necessarily a
-# problem - but a key file sshd will silently ignore, because the ownership or
-# mode is wrong, is worth saying out loud.
-verify_authorized_keys() {
-  local f perm owner
-
-  if [ -z "$SSH_USER_HOME" ]; then
-    detail "Home directory for '$OPT_USERNAME' is unknown; skipping the key check"
-    return 0
-  fi
-  f="$(ssh_authorized_keys_path)"
-
-  if [ ! -s "$f" ]; then
-    detail "No authorized_keys for '$OPT_USERNAME'; sshd falls back to whatever it was already configured to accept"
-    return 0
-  fi
-
-  owner="$(stat -c '%U' "$f" 2>/dev/null || true)"
-  perm="$(stat -c '%a' "$f" 2>/dev/null || true)"
-
-  if [ -n "$owner" ] && [ "$owner" != "$OPT_USERNAME" ]; then
-    warn "$f is owned by '$owner', not '$OPT_USERNAME'; sshd will ignore it."
-  elif [ -n "$perm" ] && [ "$perm" != "600" ] && [ "$perm" != "400" ]; then
-    warn "$f is mode $perm; sshd may refuse to read it. Expected 600."
-  else
-    ok "$(ssh_count_keys) authorized key(s) in place for '$OPT_USERNAME'"
-  fi
-  return 0
 }
 
 # =============================================================================
@@ -2229,7 +1295,7 @@ summary() {
       fi
     fi
   fi
-  row "Log" "$C_MUTED" "$LOG_FILE"
+  row "Log" "$C_MUTED" "$LOG_HINT"
 
   # The warnings again, in one place. During the run each one scrolled past
   # inside its own step; an unattended log is read from the tail, so the recap
@@ -2336,6 +1402,26 @@ installed_list() {
 # =============================================================================
 # Main
 # =============================================================================
+open_log() {
+  # fd 4 is the log. It feeds the systemd journal rather than a file: nothing
+  # to rotate, collect or clean up, journald's own caps bound the size, and
+  # fleet tooling reads it back with the same command on every host.
+  #
+  # The socket check matters: systemd-cat exists wherever systemd is installed,
+  # but with no journald behind it (a chroot, a plain Docker image) it exits at
+  # once, and the first write to a pipe nobody reads would kill this shell with
+  # SIGPIPE - silently, before a single step ran.
+  if have systemd-cat && [ -S /run/systemd/journal/stdout ]; then
+    exec 4> >(exec systemd-cat -t "$LOG_TAG" -p info)
+    LOG_READY=1
+  else
+    # No journal on this system. Command output has nowhere useful to go;
+    # --verbose puts each action on the console instead.
+    exec 4>/dev/null
+    LOG_HINT="unavailable (no systemd journal); re-run with --verbose"
+  fi
+}
+
 main() {
   parse_args "$@"
   setup_colors
@@ -2344,44 +1430,24 @@ main() {
   exec 3>&1
 
   validate_args
-
-  LOG_FILE="/var/log/server-init-$(date +%Y%m%d-%H%M%S).log"
-  if ! ( umask 077; : >"$LOG_FILE" ) 2>/dev/null; then
-    LOG_FILE="$(mktemp -t server-init-XXXXXX.log)"
-  fi
-  # A stable name for the newest log, so fleet tooling can tail or collect it
-  # without globbing on timestamps.
-  ln -sfn "$LOG_FILE" "${LOG_FILE%/*}/server-init.latest.log" 2>/dev/null || true
+  resolve_base
+  open_log
   log "$SCRIPT_NAME v$SCRIPT_VERSION starting; args: $*"
 
+  # Nothing here reads from the terminal, and when the script itself arrives on
+  # stdin (curl ... | bash) any child that reads stdin would swallow the rest
+  # of it. By this point the whole file has been parsed - this call is its last
+  # line - so cutting stdin off costs nothing and removes the hazard.
+  exec </dev/null
+
+  plan_components
   preflight
 
-  # Split the roster up front, so [n/total] is honest and the skipped
-  # components cost one quiet line instead of a stanza each. With --only=ssh
-  # the old layout printed twelve skip blocks before any work started.
-  local entry name
-  local -a to_run=() skipped=()
-  for entry in "${COMPONENTS[@]}"; do
-    name="${entry%%:*}"
-    if is_enabled "$name"; then to_run+=("$name"); else skipped+=("$name"); fi
-  done
-  STEP_TOTAL=${#to_run[@]}
-  [ "$STEP_TOTAL" -gt 0 ] || die "Every component was excluded; nothing to do."
-
-  if [ ${#skipped[@]} -gt 0 ]; then
-    local skip_list=""
-    for name in "${skipped[@]}"; do
-      if [ -z "$skip_list" ]; then skip_list="$name"; else skip_list="${skip_list} · ${name}"; fi
-    done
-    row "Skipped" "$C_MUTED" "$skip_list"
-  fi
-
   # Needed by fn_bun and the summary even when the ssh component is skipped.
-  if id -u "$OPT_USERNAME" >/dev/null 2>&1; then
-    SSH_USER_HOME="$(getent passwd "$OPT_USERNAME" 2>/dev/null | cut -d: -f6 || true)"
-  fi
+  resolve_user_home
 
-  for name in ${to_run[@]+"${to_run[@]}"}; do
+  local name
+  for name in "${TO_RUN[@]}"; do
     "fn_${name}"
   done
   step_finish
