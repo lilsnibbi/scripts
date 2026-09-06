@@ -1,6 +1,8 @@
 *
+!.gitignore
+!.gitattributes
 !Dockerfile
 !*.md
-!setup.sh
-!.gitignore
 !lib
+!lib/setup
+!*.sh

@@ -1,8 +1,9 @@
 # Server Initialization Suite
 
-A single self-contained Bash script that turns a freshly provisioned Debian or
-Ubuntu VM into a Dokploy host. It is written to run unattended on
-first boot: every step is idempotent, every network operation retries, and any
+A Bash script that turns a fresh Debian or Ubuntu machine — Proxmox VM or
+container, KVM guest, VPS, dedicated box, or a laptop serving as one — into a
+Dokploy host. It is written to run unattended on first boot, hundreds of times
+a day: every step is idempotent, every network operation retries, and any
 failure stops the run with the exact step, the exit code, and the tail of the
 log.
 
@@ -14,19 +15,17 @@ with a warning). It must run as root.
 ## Quick start
 
 ```bash
-chmod +x setup.sh
-sudo ./setup.sh
+curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- --pubkey="$(cat ~/.ssh/id_ed25519.pub)"
 ```
 
 That configures the `root` account, installs Docker and Dokploy, and leaves SSH
-authentication exactly as the image shipped it. Add `--pubkey="$(cat
-~/.ssh/id_ed25519.pub)"` to authorise a key, and `--ssh-port=N` to move the
-listening port.
+authentication exactly as the image shipped it. `--pubkey` authorises a key;
+`--ssh-port=N` moves the listening port.
 
 A more typical production invocation:
 
 ```bash
-sudo ./setup.sh \
+curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- \
   --username=deploy \
   --ssh-port=2222 \
   --ui-allow=203.0.113.9/32 \
@@ -37,8 +36,49 @@ sudo ./setup.sh \
 Preview everything without touching the system:
 
 ```bash
-sudo ./setup.sh --dry-run
+curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- --dry-run
 ```
+
+From a checkout, `sudo lib/setup.sh [options]` works the same way and uses the
+component modules beside it instead of fetching them.
+
+---
+
+## Layout
+
+The script is split into a framework and one file per component:
+
+```
+lib/
+  setup.sh            options, console output, journal logging, helpers,
+                      preflight, summary — the file you curl
+  setup/
+    update.sh         one component each; every file defines fn_<name>
+    base.sh
+    ssh.sh
+    ...
+    verify.sh
+```
+
+`setup.sh` fetches only the modules for the components that will run, from
+`<base>/setup/<name>.sh`, and it fetches all of them **before any component
+runs**. Each module carries three markers — its name, the `setup-api` number it
+was written against, and an `# end-of-module` line — and is syntax-checked, so
+a wrong file, a stale file from a half-finished deploy, or a truncated download
+aborts the run while the machine is still untouched. The `setup-api` number in
+`setup.sh` is bumped only when a helper changes incompatibly.
+
+The base defaults to `https://lilsnibbi.dev/scripts`, which serves the `lib/`
+directory of this repository. Whatever serves `setup.sh` must serve
+`setup/<name>.sh` under the same base. The base is resolved in this order:
+
+1. `--base=URL` (or an absolute directory)
+2. the `SETUP_BASE` environment variable
+3. a `setup/` directory beside `setup.sh`, when run from a checkout
+4. the default
+
+The modules are sourced into the running script, so they share its options,
+helpers and error trap, and there is nothing to install on the host.
 
 ---
 
@@ -87,6 +127,9 @@ ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@<server-ip>
 | `--hostname=NAME` | Set the system hostname (and keep `/etc/hosts` consistent). |
 | `--timezone=ZONE` | Set the timezone, e.g. `Europe/Amsterdam`. |
 | `--ui-allow=CIDR[,CIDR]` | Restrict the Dokploy UI on port 3000 to these sources. See [Dokploy UI exposure](#dokploy-ui-exposure). |
+| `--ui-public` | Expose the Dokploy UI to the whole internet. The first visitor to reach it becomes the admin. |
+| `--auto-reboot=HH:MM` | Let unattended-upgrades reboot in this window when a patch needs it. Default: never reboot automatically, which means kernel patches stay inactive until a manual reboot. |
+| `--remove-snapd` | Purge snapd and hold the package (Ubuntu). Off by default: a Docker host does not need it, but removing a package manager should be asked for, not assumed. |
 | `--reset-firewall` | Wipe existing UFW rules before applying the baseline. Off by default so a re-run does not destroy custom rules. |
 | `--reinstall-dokploy` | Reinstall Dokploy even if it is present. **Destructive** — Dokploy's installer leaves and re-initialises Docker Swarm. |
 
@@ -105,7 +148,8 @@ Unknown component names are rejected rather than silently ignored, so a typo in
 
 | Option | Description |
 | :--- | :--- |
-| `--dry-run` | Show what would happen; change nothing. |
+| `--base=URL` | Fetch component modules from `URL/setup/<name>.sh`. Also accepts an absolute directory. Default: `https://lilsnibbi.dev/scripts`, or the `setup/` directory beside the script when run from a checkout. See [Layout](#layout). |
+| `--dry-run` | Show what would happen; change nothing. The modules are still fetched, since a dry run has to describe them. |
 | `--verbose` | Disable the spinner and print each action as a plain line. Useful when piping to a file. |
 | `--no-color` | Disable coloured output. Colour is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set. |
 | `--version` | Print the script version and exit. |
@@ -117,19 +161,27 @@ Unknown component names are rejected rather than silently ignored, so a typo in
 
 Components run in this order. Any of them can be skipped.
 
+Before the first component, preflight installs the prerequisites the run cannot
+start without — `curl`, `unzip` and `ca-certificates` — so they are present
+whatever `--only` or `--exclude` says. `unzip` in particular is missing from
+most minimal images and required before anything else runs.
+
 | Component | What it does |
 | :--- | :--- |
 | `update` | Sets hostname and timezone, refreshes apt indexes, then runs a full `dist-upgrade` including phased updates, and autoremoves. Always the first step. |
 | `base` | Installs `curl`, `wget`, `git`, `jq`, `unzip`, `iproute2`, `dnsutils`, `openssh-server`, `sudo`, `ufw`, and related utilities. |
 | `ssh` | Creates the login account, optionally appends a public key, and sets the sshd port. |
 | `firewall` | Applies the UFW baseline: deny incoming, allow outgoing, rate-limited SSH, and the Dokploy ports. |
-| `fail2ban` | Installs fail2ban with an SSH jail and a `recidive` jail, reading the systemd journal. |
-| `swap` | Creates a swapfile when the machine has under 8 GB of RAM and no swap. |
+| `fail2ban` | Installs fail2ban with an SSH jail (reading the systemd journal) and a `recidive` jail (reading fail2ban's own log). |
+| `hardening` | Kernel network sysctls (Docker-safe), journald size caps, and locks root's password once the login account demonstrably has keys. |
+| `tuning` | Environment-aware performance tuning: BBR and backlog sysctls, inotify and map-count limits, sleep/lid inhibited, performance CPU governor on bare metal, Ubuntu crash/ad noise off, optional snapd removal. Each piece probes for its environment (container, KVM, VPS, dedicated, laptop) and skips what does not apply. |
+| `swap` | Creates a swapfile when the machine has under 8 GB of RAM and no swap. Skipped in containers, where swap belongs to the host. |
 | `docker` | Installs Docker CE from Docker's apt repository and configures container log rotation. |
 | `dokploy` | Installs Dokploy, then optionally restricts its UI port. |
 | `cloudflared` | Installs the Cloudflare Zero Trust tunnel daemon. |
-| `bun` | Installs the Bun JavaScript runtime into the login account's home directory. |
-| `unattended` | Enables automatic security updates. Runs last so it cannot contend for the apt lock. |
+| `bun` | Installs the Bun JavaScript runtime into the login account's home directory, running the official installer as that account. |
+| `unattended` | Enables automatic security updates. Runs after everything else so it cannot contend for the apt lock. |
+| `verify` | Read-only checks: sshd listening on the configured port, UFW active, and the account's `authorized_keys` usable. |
 
 ---
 
@@ -250,9 +302,16 @@ The console shows a numbered step list, a spinner for long operations, and a
 final summary with installed versions, the SSH details, every warning raised
 during the run, and the remaining manual steps.
 
-Full command output goes to `/var/log/server-init-<timestamp>.log`. On failure
-the script prints the failing step, the exit code, and the last twenty lines of
-that log.
+**No log file is written.** Full command output goes to the systemd journal
+under the tag `server-init`:
+
+```bash
+journalctl -t server-init
+```
+
+On failure the script prints the failing step, the exit code, and the last
+twenty log lines from the journal. The journal is size-capped by the
+`hardening` component, so logging can never fill the disk.
 
 Colour and the spinner switch off automatically when the output is not a
 terminal, so piping to a file produces clean text.
@@ -264,6 +323,15 @@ terminal, so piping to a file produces clean text.
 Several things that commonly break unattended first-boot scripts are handled
 explicitly:
 
+- **Modules before changes.** Every component module is fetched, checked for
+  its markers and syntax-checked before the first component runs, so a bad
+  deploy or a network fault aborts with the machine untouched.
+- **Prerequisites first.** `curl`, `unzip` and `ca-certificates` are installed
+  in preflight, ahead of every component, so even `--only=bun` has what it
+  needs.
+- **Wrong clock.** Time synchronisation is confirmed in preflight, before the
+  first apt call and TLS handshake. A skewed clock makes apt reject Release
+  files and TLS fail on `notBefore`, and neither error mentions the clock.
 - **apt lock contention.** On a freshly booted cloud VM the `apt-daily` and
   `unattended-upgrades` timers hold the dpkg lock for the first minute or two.
   The script waits for the lock (up to five minutes) and waits for `cloud-init`
@@ -273,9 +341,20 @@ explicitly:
   unattended run forever. `NEEDRESTART_MODE=a` suppresses it.
 - **Network flakiness.** Every download and apt operation is retried three times
   with backoff.
-- **Piped installers.** The Dokploy installer is downloaded to a file and
-  checked for a shebang before being executed, so a captive portal or error page
-  is never piped into a shell.
+- **Piped installers.** The Dokploy and Bun installers are downloaded to a file
+  and checked for a shebang before being executed, so a captive portal or error
+  page is never piped into a shell.
+- **`curl | bash` itself.** Once the script has been parsed it closes its own
+  stdin, so no child can swallow the rest of the script off the pipe. It also
+  pins `PATH` to include the sbin directories, which `pct exec`, cloud-init and
+  a bare root shell do not always provide.
+- **No journal.** The journal socket is checked before logging starts. A host
+  where systemd is installed but journald is not running (a chroot, a plain
+  Docker image) would otherwise kill the script with SIGPIPE on its first log
+  line.
+- **Containers.** Proxmox CTs are a first-class target. Things the host owns —
+  the clock, swap, the CPU governor, power management — are skipped there with
+  a note rather than attempted and warned about.
 - **Port conflicts.** Dokploy's installer aborts if anything holds ports 80, 443
   or 3000. The script checks first and reports which process holds the port.
 
@@ -317,8 +396,22 @@ Inside the container:
 
 ```bash
 cd /opt/init-scripts
-./setup.sh --dry-run
-./setup.sh --username=deploy --ssh-port=2222 --ui-allow=10.0.0.0/8
+lib/setup.sh --dry-run
+lib/setup.sh --username=deploy --ssh-port=2222 --ui-allow=10.0.0.0/8
+```
+
+Run from the checkout like this, the script loads the modules from
+`lib/setup/` beside it. To exercise the network path instead, point it at a
+served copy — a branch on GitHub, say:
+
+```bash
+lib/setup.sh --dry-run --base=https://raw.githubusercontent.com/lilsnibbi/scripts/refs/heads/<branch>/lib
+```
+
+The piped form can be tested the same way:
+
+```bash
+cat lib/setup.sh | bash -s -- --dry-run --base=/opt/init-scripts/lib
 ```
 
 Verify the result from inside the same container:
@@ -339,8 +432,16 @@ itself on a real VM.
 
 ## Troubleshooting
 
-**The run failed partway through.** Read the printed step and the log path. Fix
-the cause, then re-run just that part, for example `sudo ./setup.sh --only=docker`.
+**The run failed partway through.** Read the printed step, then the journal
+(`journalctl -t server-init`). Fix the cause and re-run just that part, for
+example `sudo ./setup.sh --only=docker`.
+
+**"Could not load module" or "out of sync".** The framework and the modules
+are served separately, and each is cached for a few minutes. A run that lands
+in the window right after a deploy can see a new `setup.sh` with an old module,
+or the reverse. Nothing has been changed on the machine at that point; retry a
+few minutes later. A persistent failure means the base URL is not serving
+`setup/<name>.sh`.
 
 **SSH stopped working.** Existing sessions survive an sshd restart, so use the
 session you still have open. The previous configuration is backed up next to

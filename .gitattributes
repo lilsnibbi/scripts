@@ -1,0 +1,4 @@
+# Scripts are fetched raw and piped into bash on Linux; a CRLF checkout would
+# break every run, so line endings are pinned regardless of core.autocrlf.
+*.sh text eol=lf
+Dockerfile text eol=lf

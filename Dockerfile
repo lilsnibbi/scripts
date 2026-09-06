@@ -18,8 +18,8 @@
 #
 #  Exec in and run the script by hand:
 #    docker exec -it init-test bash
-#    cd /opt/init-scripts && ./setup.sh --dry-run
-#    ./setup.sh --username=deploy --ssh-port=2222 --ui-allow=10.0.0.0/8
+#    cd /opt/init-scripts && lib/setup.sh --dry-run
+#    lib/setup.sh --username=deploy --ssh-port=2222 --ui-allow=10.0.0.0/8
 #
 #  Reset to a clean machine between attempts:
 #    docker rm -f init-test && docker run -d ... (as above)
@@ -57,7 +57,7 @@ RUN systemctl mask \
         getty.target \
         console-getty.service
 
-# setup.sh writes its log to /var/log and expects a writable /run.
+# setup.sh logs to the journal and expects a writable /run.
 VOLUME [ "/sys/fs/cgroup" ]
 
 WORKDIR /opt/init-scripts
