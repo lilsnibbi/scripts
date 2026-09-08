@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: hardening
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: hardening - Kernel network hardening, journald limits, root
 #  password lock
@@ -115,6 +115,10 @@ CONF
 # the replacement account is demonstrably usable, and never when root is the
 # account being configured.
 lock_root_password() {
+  if local_access_enabled; then
+    detail "Local computer: preserving the root password for console/rescue access"
+    return 0
+  fi
   if [ "$OPT_USERNAME" = "root" ]; then
     detail "Root is the login account; leaving its password alone"
     return 0

@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 # setup-module: ssh
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: ssh - Create the login account and set the SSH port
 #
-#  Scope is deliberately narrow: create the login account, append a public key
-#  if one was supplied, and set the listening port. Authentication directives -
-#  PasswordAuthentication, PermitRootLogin, AllowUsers, AuthenticationMethods -
-#  are never written, because getting any of them wrong on an unattended run
-#  locks the host out with nobody at the console to undo it. Port is the one
-#  exception: it cannot deny a login on its own, and the firewall step needs to
-#  agree with it.
+#  Configure the account and port, preserving authentication by default.
+#  On eligible --local computers a Match block permits the selected account's
+#  existing password from RFC1918 sources. Configuration changes are rolled
+#  back if syntax, effective-policy validation or the service restart fails.
 #
 #  Sourced by setup.sh, never run on its own. Everything here executes inside
 #  the main script's shell: its options (OPT_*), helpers (step, run, run_spin,
@@ -150,7 +147,7 @@ ssh_apply_socket_port() {
   local dir=/etc/systemd/system/ssh.socket.d
   local content
   content="$(printf '[Socket]\nListenStream=\nListenStream=%s' "$OPT_SSH_PORT")"
-  write_file "$dir/10-port.conf" 0644 "$content" || true
+  ssh_write_file "$dir/10-port.conf" 0644 "$content"
   run systemctl daemon-reload
   detail "ssh.socket configured to listen on port $OPT_SSH_PORT"
   return 0
@@ -161,8 +158,8 @@ ssh_restart() {
   systemctl list-unit-files ssh.service >/dev/null 2>&1 || unit="sshd"
 
   if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
-    run systemctl restart ssh.socket || warn "Could not restart ssh.socket."
-    run systemctl restart "$unit" || true
+    run systemctl restart ssh.socket || die "Could not restart ssh.socket."
+    run systemctl restart "$unit" || die "Could not restart $unit."
   else
     run systemctl restart "$unit" || die "sshd failed to restart. Existing sessions stay open; fix the config before disconnecting."
   fi
@@ -175,60 +172,113 @@ ssh_restart() {
   fi
 }
 
-# sshd -t can fail for reasons that have nothing to do with this configuration
-# (a broken host key, a bad directive someone else left behind). Rejecting our
-# drop-in in that case would silently discard the port change, so when
-# validation fails the baseline is tested too and only a genuine regression is
-# fatal.
-validate_sshd_config() {
-  local ours="$1" err
-
-  if err="$(sshd -t 2>&1)"; then
-    detail "sshd configuration validated"
-    return 0
-  fi
-
-  log "sshd -t failed with our drop-in: $err"
-  mv "$ours" "${ours}.rejected"
-
-  local baseline_err
-  if baseline_err="$(sshd -t 2>&1)"; then
-    # The baseline is fine, so the fault is ours. Leave SSH untouched.
-    rm -f "${ours}.rejected"
-    die "The generated sshd configuration was rejected: ${err}. It has been removed and SSH is unchanged."
-  fi
-
-  # The baseline is broken too, so this is pre-existing and not something the
-  # drop-in caused. Keep the drop-in and make the real problem visible.
-  mv "${ours}.rejected" "$ours"
-  warn "sshd reports a pre-existing problem: ${baseline_err}"
-  warn "The port drop-in was applied anyway. Fix the above before relying on it."
-  return 0
+ssh_write_file() {
+  if [ -f "$1" ] && [ "$(cat "$1")" = "$3" ]; then return 0; fi
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then log "would write: $1"; return 0; fi
+  mkdir -p "$(dirname "$1")" || die "Could not create SSH configuration directory."
+  printf '%s\n' "$3" >"$1" || die "Could not write SSH configuration: $1"
+  chmod "$2" "$1" || die "Could not set SSH configuration permissions: $1"
 }
 
-fn_ssh() {
-  step "SSH access"
+# Keep Match out of the global drop-in: its scope would otherwise leak into
+# subsequent global-only directives. Insert before the main file's first Match,
+# after global settings, and remove exactly our marked block on a normal rerun.
+ssh_local_config() {
+  local enabled="$1" user="$2"
+  awk -v enabled="$enabled" -v user="$user" -v cidrs="$UI_LOCAL_CIDRS" '
+    function emit() {
+      if (enabled != 1 || emitted) return
+      print "# BEGIN setup.sh local SSH"
+      print "Match User " user " Address " cidrs
+      print "    PasswordAuthentication yes"
+      # Explicit alternatives avoid OpenSSH bug 3657 (any after a non-any
+      # global AuthenticationMethods fails on Ubuntu 22.04/24.04).
+      print "    AuthenticationMethods publickey password"
+      print "    PubkeyAuthentication yes"
+      print "    PermitEmptyPasswords no"
+      if (user == "root") print "    PermitRootLogin yes"
+      print "Match all"
+      print "# END setup.sh local SSH"
+      emitted=1
+    }
+    $0 == "# BEGIN setup.sh local SSH" { if (inside) exit 65; inside=1; next }
+    $0 == "# END setup.sh local SSH" { if (!inside) exit 65; inside=0; next }
+    inside { next }
+    tolower($1) == "match" { emit() }
+    { print }
+    END { if (inside) exit 65; emit() }
+  '
+}
 
-  ssh_create_user
-  ssh_setup_keys
-
+# Run in a subshell so this transaction's traps cannot replace framework traps.
+ssh_configure() (
   local ours=/etc/ssh/sshd_config.d/00-server-init.conf
+  local main=/etc/ssh/sshd_config
+  local snapshot="" committed=0 restarting=0 f i content err
+  local -a paths=()
+  if [ "$OPT_DRY_RUN" -eq 0 ]; then
+    mkdir -p /run/sshd
+    if ! err="$(sshd -t 2>&1)"; then
+      die "Existing sshd configuration is invalid; SSH was not changed: $err"
+    fi
+    paths=("$main" "$ours" /etc/systemd/system/ssh.socket.d/10-port.conf)
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$f" ] && [ "$f" != "$ours" ] && paths+=("$f")
+    done
+    for f in "${paths[@]}"; do
+      [ ! -L "$f" ] || die "Refusing to rewrite symlinked SSH configuration: $f"
+    done
+    snapshot="$(mktemp -d)"
+    # Arm rollback only after every snapshot has been made successfully.
+    for i in "${!paths[@]}"; do
+      f="${paths[$i]}"
+      if [ -e "$f" ]; then cp -p "$f" "$snapshot/$i"; fi
+    done
+    trap '
+      rc=$?
+      trap - EXIT ERR INT TERM
+      if [ "$committed" -eq 0 ]; then
+        restore_failed=0
+        for i in "${!paths[@]}"; do
+          f="${paths[$i]}"
+          if [ -e "$snapshot/$i" ]; then
+            cp -p "$snapshot/$i" "$f" || restore_failed=1
+          else
+            rm -f "$f" || restore_failed=1
+          fi
+        done
+        if [ "$restore_failed" -eq 1 ]; then
+          warn "SSH rollback was incomplete. Recovery copies are in $snapshot; keep this session open."
+          exit 1
+        fi
+        if [ "$restarting" -eq 1 ]; then
+          systemctl daemon-reload >&4 2>&1 || true
+          if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
+            systemctl restart ssh.socket >&4 2>&1 || true
+          fi
+          systemctl restart ssh >&4 2>&1 || systemctl restart sshd >&4 2>&1 || true
+        fi
+        warn "SSH configuration restored after failure. Keep this session open and verify access."
+      fi
+      rm -r -- "$snapshot"
+      exit "$rc"
+    ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+
   ssh_ensure_include
   ssh_neutralise_conflicts "$ours"
 
-  # One directive. Everything this file used to set - PermitRootLogin,
-  # PasswordAuthentication, AllowUsers, AuthenticationMethods, MaxAuthTries,
-  # the KexAlgorithms/Ciphers/MACs lists - is gone on purpose. Any of them can
-  # refuse a login, and an unattended run has nobody to notice.
-  local content
+  # Global port settings must stay outside the conditional LAN policy.
   content="$(cat <<CONF
 # Managed by setup.sh (Server Initialization Suite) — do not edit by hand.
 #
 # This file sorts first inside sshd_config.d on purpose: sshd keeps the first
 # value it sees for a directive, so nothing later can move the port back.
 #
-# Port is the only setting managed here. Authentication is left to the system's
-# own configuration.
+# Port is the only setting in this drop-in. An eligible --local exception is
+# managed separately at the end of the main config's global section.
 
 Port $OPT_SSH_PORT
 CONF
@@ -236,19 +286,62 @@ CONF
 
   # No backup here: this file is fully managed and regenerated from scratch, so
   # a .bak of it carries no information. Backups are for files the system owns.
-  write_file "$ours" 0644 "$content" || true
+  ssh_write_file "$ours" 0644 "$content"
 
   if [ "$OPT_DRY_RUN" -eq 0 ]; then
-    # sshd -t needs the privilege separation directory, which normally only
-    # exists once sshd has run at least once.
-    mkdir -p /run/sshd
-    validate_sshd_config "$ours"
+    content="$(ssh_local_config "$LOCAL_ACCESS_ENABLED" "$OPT_USERNAME" <"$main")" \
+      || die "Malformed managed local SSH block; refusing to change it."
+    # Write failures must abort the transaction; write_file returns 1 for an
+    # unchanged file, so compare first instead of masking its write failures.
+    if [ "$(cat "$main")" != "$content" ]; then
+      printf '%s\n' "$content" >"$main"
+    fi
+    if ! err="$(sshd -t 2>&1)"; then die "Generated sshd configuration is invalid: $err"; fi
+    if local_access_enabled; then
+      ssh_validate_local_policy
+    fi
+    detail "sshd configuration validated"
+  elif local_access_enabled; then
+    detail "Would enable RFC1918 SSH password login for '$OPT_USERNAME'"
   fi
 
   ssh_apply_socket_port
+  restarting=1
   ssh_restart
+  committed=1
+)
 
-  ok "sshd listening on port $OPT_SSH_PORT (authentication left unchanged)"
+ssh_validate_local_policy() {
+  local addr effective
+  for addr in 10.0.0.1 172.16.0.1 192.168.0.1; do
+    effective="$(sshd -T -C "user=$OPT_USERNAME,addr=$addr,host=$addr" 2>&1)" \
+      || die "Could not evaluate local SSH policy: $effective"
+    if ! grep -qx 'passwordauthentication yes' <<<"$effective" \
+       || ! grep -qx 'authenticationmethods publickey password' <<<"$effective" \
+       || ! grep -qx 'pubkeyauthentication yes' <<<"$effective" \
+       || ! grep -qx 'permitemptypasswords no' <<<"$effective"; then
+      die "An existing Match rule overrides the LAN SSH exception for $addr."
+    fi
+    if [ "$OPT_USERNAME" = root ] && ! grep -qx 'permitrootlogin yes' <<<"$effective"; then
+      die "An existing Match rule blocks root LAN SSH login."
+    fi
+  done
+}
+
+fn_ssh() {
+  step "SSH access"
+  ssh_create_user
+  ssh_setup_keys
+  ssh_configure
+
+  if local_access_enabled; then
+    ok "sshd port $OPT_SSH_PORT: LAN password login enabled for '$OPT_USERNAME'"
+    if [ "$OPT_DRY_RUN" -eq 0 ] && [ "$(passwd -S "$OPT_USERNAME" | awk '{print $2}')" != P ]; then
+      warn "'$OPT_USERNAME' needs an unlocked password: run 'sudo passwd $OPT_USERNAME'. No password was set or unlocked by setup."
+    fi
+  else
+    ok "sshd listening on port $OPT_SSH_PORT (system authentication preserved)"
+  fi
 
   if [ "$OPT_SSH_PORT" != "22" ]; then
     warn "SSH now listens on port $OPT_SSH_PORT. Verify a new session works before closing this one."

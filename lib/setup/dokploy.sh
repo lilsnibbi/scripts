@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: dokploy
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: dokploy - Install the Dokploy PaaS platform
 #

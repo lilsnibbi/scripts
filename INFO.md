@@ -142,11 +142,8 @@ first.
 
 ### 3. `ssh` — Account, key, and port
 
-This step used to harden sshd. It no longer does, and that is the point: every
-authentication directive worth setting is one that can also refuse a login, and
-an unattended first-boot run has nobody at the console to notice. `Port` is the
-only directive still written, because it cannot deny a login by itself and the
-firewall step has to agree with it.
+Authentication is preserved by default. Eligible `--local` laptops/desktops
+get a scoped LAN password exception for the selected account, described below.
 
 1. **Create the account.** With the default `--username=root` nothing is
    created. Otherwise the user is created if missing, added to the `sudo` group,
@@ -157,7 +154,7 @@ firewall step has to agree with it.
    given and not already present; otherwise whatever the account already has is
    left alone. The script generates nothing, and removes nothing. An account
    with no keys is not an error — password authentication is whatever the image
-   configured, and this script does not change it.
+   configured, except for an eligible `--local` exception.
 3. **Ensure the include.** Adds `Include /etc/ssh/sshd_config.d/*.conf` to the
    top of `/etc/ssh/sshd_config` if it is missing, as on Debian 11.
 4. **Neutralise conflicting `Port` lines.** Comments out `Port` wherever else it
@@ -174,14 +171,17 @@ firewall step has to agree with it.
    ```
 
    The `00-` prefix guarantees it is read first.
-6. **Validate.** Runs `sshd -t`. On failure the baseline is tested too: if the
-   baseline passes, the drop-in is the culprit and is removed, leaving SSH
-   untouched, and the run stops. If the baseline also fails, the problem
-   pre-dates this script, so the drop-in is kept and the real error is
-   reported as a warning.
+6. **Local policy and validation.** A marked `Match User ... Address ...` block
+   is inserted before the main file's first Match, after global directives.
+   It permits password or public-key authentication from RFC1918 addresses,
+   disallows empty passwords, and permits root passwords only when root is
+   the selected account. Rerunning SSH without eligible local mode removes
+   the block. Baseline and final syntax must pass `sshd -t`; `sshd -T -C`
+   checks LAN policy precedence. Failures restore all changed SSH config files.
 7. **Apply the port.** On socket-activated systems (Ubuntu 24.04, Debian 13) the
    `Port` directive is ignored, so a `ssh.socket` drop-in is written instead.
-8. **Restart sshd** and confirm it is active.
+8. **Restart sshd** and confirm it is active. Restart failures restore the SSH
+   and socket configurations and attempt to restart the previous configuration.
 
 Existing SSH sessions survive the restart, which is why the summary insists on
 verifying a new login before disconnecting.
@@ -230,6 +230,7 @@ Three independent pieces:
   are already capped in `daemon.json`; without this the journal grows into a
   share of the whole disk.
 - **Root password lock.** Only when a non-root `--username` was given *and*
+  local mode is inactive and
   that account already has at least one authorized key. Locking root's
   password affects console and rescue logins too, so it never happens before a
   replacement way in demonstrably exists.
@@ -314,7 +315,9 @@ re-applied at boot by a small systemd unit, because Docker's rules run ahead of
 UFW's and iptables rules do not persist.
 
 The allowed sources are whatever `--ui-allow` named, plus the RFC1918 ranges
-when `--local` was given; the two add up. With neither, the chain is a bare
+when `--local` is enabled on a detected physical laptop/desktop; the two add up.
+Servers, VMs, CTs, containers and unknown hardware ignore `--local` entirely;
+explicit `--ui-allow` remains available. With neither, the chain is a bare
 `DROP` and the port is closed to everything except loopback — which is why an
 SSH tunnel works out of the box but another machine on the LAN does not. That
 is the intended default: the window between this script finishing and a human

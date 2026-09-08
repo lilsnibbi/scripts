@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: docker
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: docker - Install Docker CE with container log rotation
 #

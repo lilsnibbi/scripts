@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: firewall
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: firewall - Configure the UFW firewall
 #

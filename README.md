@@ -116,8 +116,8 @@ ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@<server-ip>
 
 | Option | Description |
 | :--- | :--- |
-| `--username=NAME` | Account to configure. Default `root`. A non-root name is created if missing and given passwordless sudo. Root SSH login is left as the system had it. |
-| `--ssh-port=N` | Port for sshd, and the port opened in the firewall. Default `22`. The only sshd setting the script writes. |
+| `--username=NAME` | Account to configure. Default `root`. A non-root name is created if missing and given passwordless sudo. Eligible `--local` permits this account's LAN password login. |
+| `--ssh-port=N` | Port for sshd, and the port opened in the firewall. Default `22`. |
 | `--pubkey="ssh-..."` | Append this public key to the account's `authorized_keys`. Optional. |
 
 ### System
@@ -127,7 +127,7 @@ ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@<server-ip>
 | `--hostname=NAME` | Set the system hostname (and keep `/etc/hosts` consistent). |
 | `--timezone=ZONE` | Set the timezone, e.g. `Europe/Amsterdam`. |
 | `--ui-allow=CIDR[,CIDR]` | Restrict the Dokploy UI on port 3000 to these sources. See [Dokploy UI exposure](#dokploy-ui-exposure). |
-| `--local` | Allow the private ranges (`10/8`, `172.16/12`, `192.168/16`) to reach the Dokploy UI. The shorthand for "reachable from my LAN" without naming a subnet. Adds to `--ui-allow` rather than replacing it. |
+| `--local` | Physical laptops/desktops only: allow RFC1918 sources (`10/8`, `172.16/12`, `192.168/16`) to reach Dokploy and use the selected account's SSH password. Ignored on servers, VMs, CTs, containers and unknown hardware. Adds to `--ui-allow`. |
 | `--ui-public` | Expose the Dokploy UI to the whole internet. The first visitor to reach it becomes the admin. |
 | `--auto-reboot=HH:MM` | Let unattended-upgrades reboot in this window when a patch needs it. Default: never reboot automatically, which means kernel patches stay inactive until a manual reboot. |
 | `--remove-snapd` | Purge snapd and hold the package (Ubuntu). Off by default: a Docker host does not need it, but removing a package manager should be asked for, not assumed. |
@@ -207,21 +207,33 @@ What it still does to SSH:
 | Comments out `Port` elsewhere in `sshd_config.d` | sshd keeps the *first* value it finds, so a cloud image's `50-cloud-init.conf` would otherwise win |
 | Opens that port in UFW, rate-limited | |
 
-That drop-in is the entire managed configuration:
+The global drop-in contains only the port:
 
 ```
 Port 2222
 ```
 
-Nothing else. `PasswordAuthentication`, `PermitRootLogin`, `AllowUsers`,
-`AuthenticationMethods`, `MaxAuthTries`, `LoginGraceTime`, the
-`KexAlgorithms`/`Ciphers`/`MACs` lists, and the Diffie-Hellman moduli pruning
-were all removed. Whatever the image shipped, it keeps.
+With `--local` on a detected physical laptop/desktop, a managed `Match` block
+in the main configuration also permits password or public-key login for
+`--username` from RFC1918 sources. Root password login is allowed in that
+scope when root is selected. Other users and sources retain their existing
+policy; IPv6, loopback and CGNAT get no password exception. Existing account
+allow/deny rules, PAM restrictions, UFW and fail2ban still apply.
 
-The drop-in is still validated with `sshd -t` before sshd is restarted. If
-validation fails, the drop-in is removed and SSH is left exactly as it was. If
-the *baseline* configuration also fails validation, the problem pre-dates this
-script; the drop-in is kept and the real error is reported as a warning.
+No password is set or unlocked. An account without an unlocked password needs
+`sudo passwd USER` before password login can work. Local mode preserves root's
+password for console/rescue access. A rerun of the SSH component without an
+eligible `--local` removes the managed exception.
+
+Virtualization is checked before hardware classification. Unknown or failed
+probes disable local mode. Server chassis and an explicit `hostnamectl`
+server classification are excluded. Hardware cannot distinguish a desktop
+used as a dedicated server: omit `--local` on such a machine.
+
+The original configuration must pass `sshd -t` before configuration changes.
+The result is syntax-checked and its local policy checked with `sshd -T -C`.
+Failed validation or restart restores the previous configuration, including
+the socket drop-in. Symlinked configuration files are rejected before edits.
 
 > **Hardening is left to you.** Change the port here, then apply your own
 > authentication policy by hand, from a session you have already confirmed
@@ -250,12 +262,16 @@ IP with port 3000 open, that can be someone else.
 By default port 3000 is closed to the network entirely. Loopback is unaffected —
 a published port reached over `127.0.0.1` never traverses the `FORWARD` chain —
 so an SSH tunnel works with no rules at all, but **another machine on your LAN
-cannot reach it**. That is deliberate, and it is what `--local` opts out of:
+cannot reach it**. On a physical laptop/desktop, opt into LAN access with:
 
 ```bash
-# reachable from any private address (10/8, 172.16/12, 192.168/16)
+# physical laptop/desktop: reachable from RFC1918 addresses
 sudo ./setup.sh --only=dokploy --local
 ```
+
+On a dedicated server, VM or CT, use `--ui-allow=192.168.1.0/24` (with your
+actual subnet). `--local` is ignored there. `--only=dokploy` does not run the
+SSH component; run the full script with `--local` to configure both.
 
 Or name the sources exactly, which is tighter:
 
@@ -396,6 +412,16 @@ explicitly:
 ---
 
 ## Testing locally
+
+The SSH regression suite uses real OpenSSH in an isolated Linux mount
+namespace, with service operations mocked. It tests hardware gating, source
+and user scope, reruns, policy removal, rollback and dry-run behavior:
+
+```bash
+sudo bash tests/local-ssh.sh
+```
+
+It does not validate actual Wi-Fi connections or a live Dokploy deployment.
 
 `Dockerfile` builds an Ubuntu 24.04 image running systemd as PID 1, so sshd,
 ufw, fail2ban and dockerd behave the way they do on a real VM rather than being

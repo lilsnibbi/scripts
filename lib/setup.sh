@@ -16,9 +16,8 @@
 #
 #    curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- [options]
 #
-#  It deliberately does NOT harden sshd. The only sshd setting it writes is
-#  Port, and it generates no keys. Rewriting authentication from an unattended
-#  script is how a host ends up unreachable with nobody watching the console.
+#  SSH authentication is preserved by default. --local enables LAN password
+#  login for the selected account on a detected physical laptop or desktop.
 #
 #  Designed to run unattended on first boot. Every step is idempotent and safe
 #  to re-run.
@@ -31,7 +30,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -45,7 +44,8 @@ SETUP_BASE="${SETUP_BASE:-}"
 # before anything is touched rather than failing halfway through.
 #
 # 2: added ui_allow_list, which the dokploy module calls.
-SETUP_API=2
+# 3: hardware-gated local_access_enabled, shared by SSH, Dokploy and hardening.
+SETUP_API=3
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -81,6 +81,7 @@ OPT_TIMEZONE_SET=0
 OPT_UI_ALLOW=""
 OPT_UI_PUBLIC=0
 OPT_UI_LOCAL=0
+LOCAL_ACCESS_ENABLED=0
 OPT_AUTO_REBOOT=""
 OPT_EXCLUDE=""
 OPT_ONLY=""
@@ -655,6 +656,46 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # - belong to the host in a container, and the components skip them there.
 in_container() { systemd-detect-virt --container >/dev/null 2>&1; }
 
+# Require affirmative bare-metal detection before trusting chassis information:
+# containers can expose their host's DMI. Missing/failed probes fail closed.
+is_local_computer() {
+  [ ! -e /.dockerenv ] && [ ! -e /run/.containerenv ] \
+    && [ ! -e /run/systemd/container ] || return 1
+  have systemd-detect-virt || return 1
+  local virt rc chassis
+  if virt="$(systemd-detect-virt 2>/dev/null)"; then return 1; else rc=$?; fi
+  [ "$rc" -eq 1 ] && [ "$virt" = "none" ] || return 1
+
+  # Respect an explicit server classification (including hostnamectl overrides).
+  chassis="$(hostnamectl chassis 2>/dev/null || true)"
+  case "$chassis" in
+    server|vm|container|embedded|handset|tablet) return 1 ;;
+  esac
+  # SMBIOS desktop, low-profile desktop, pizza box, mini-tower, tower,
+  # portable, laptop, notebook, all-in-one, sub-notebook; not server chassis.
+  chassis="$(cat /sys/class/dmi/id/chassis_type 2>/dev/null || true)"
+  case "$chassis" in
+    3|4|5|6|7|8|9|10|13|14) return 0 ;;
+    '')
+      chassis="$(hostnamectl chassis 2>/dev/null || true)"
+      case "$chassis" in desktop|laptop) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+local_access_enabled() { [ "$LOCAL_ACCESS_ENABLED" -eq 1 ]; }
+
+resolve_local_access() {
+  LOCAL_ACCESS_ENABLED=0
+  [ "$OPT_UI_LOCAL" -eq 1 ] || return 0
+  if is_local_computer; then
+    LOCAL_ACCESS_ENABLED=1
+    detail "--local enabled for this physical laptop/desktop"
+  else
+    warn "--local ignored: this is not a confirmed physical laptop/desktop. Use --ui-allow for server/VM/CT Dokploy access."
+  fi
+}
+
 backup_file() {
   local f="$1"
   [ -f "$f" ] || return 0
@@ -726,10 +767,10 @@ usage() {
   ui " ${C_TITLE}${BOLD}Account and SSH${NC}"
   ui "   ${C_INFO}--username=NAME${NC}      Login account to configure. Default: ${BOLD}root${NC}."
   ui "                        A non-root name is created with passwordless sudo."
-  ui "                        Root SSH login is left as the system had it."
+  ui "                        --local permits LAN passwords for this account."
   ui "   ${C_INFO}--ssh-port=N${NC}         Port for sshd, and the port opened in the firewall."
-  ui "                        Default: ${BOLD}22${NC}. This is the ${BOLD}only${NC} sshd setting the"
-  ui "                        script writes; authentication is left alone."
+  ui "                        Default: ${BOLD}22${NC}. Authentication is preserved unless"
+  ui "                        --local applies on a physical laptop/desktop."
   ui "   ${C_INFO}--pubkey=\"ssh-... \"${NC}  Append this public key to the account's authorized_keys."
   ui "                        Optional. Existing keys are never removed."
   ui ""
@@ -744,8 +785,9 @@ usage() {
   ui "                        SSH or Cloudflare tunnel."
   ui "   ${C_INFO}--local${NC}              Allow the private ranges (10/8, 172.16/12,"
   ui "                        192.168/16) to reach the Dokploy UI on port 3000."
-  ui "                        The shorthand for reaching it from your own LAN"
-  ui "                        without naming a subnet. Adds to --ui-allow."
+  ui "                        Also permit LAN SSH passwords for --username."
+  ui "                        Physical laptops/desktops only; ignored on servers,"
+  ui "                        VMs, containers or unknown hardware. Adds to --ui-allow."
   ui "   ${C_INFO}--ui-public${NC}          Expose the Dokploy UI to the whole internet."
   ui "                        ${C_WARN}The first visitor to reach it becomes the admin.${NC}"
   ui "   ${C_INFO}--auto-reboot=HH:MM${NC}  Let unattended-upgrades reboot in this window when a"
@@ -923,7 +965,7 @@ UI_LOCAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 # writes the iptables rule, and the summary, which reports the address.
 ui_allow_list() {
   local out="$OPT_UI_ALLOW"
-  if [ "$OPT_UI_LOCAL" -eq 1 ]; then
+  if local_access_enabled; then
     if [ -n "$out" ]; then out="${out},${UI_LOCAL_CIDRS}"; else out="$UI_LOCAL_CIDRS"; fi
   fi
   printf '%s' "$out"
@@ -1188,6 +1230,7 @@ preflight() {
   esac
 
   banner
+  resolve_local_access
 
   # A Proxmox CT is a normal target, so a container is a note, not a warning.
   # Docker is the exception: Dokploy's installer refuses to run inside one.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: cloudflared
-# setup-api: 2
+# setup-api: 3
 # =============================================================================
 #  Component: cloudflared - Install the Cloudflare Zero Trust tunnel daemon
 #
