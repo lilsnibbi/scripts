@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: unattended
-# setup-api: 4
+# setup-api: 5
 # =============================================================================
 #  Component: unattended - Enable automatic security updates
 #

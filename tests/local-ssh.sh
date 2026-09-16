@@ -228,6 +228,6 @@ printf 'PASS: dry-run and password preservation\n'
 
 for f in "$repo/lib/setup.sh" "$repo"/lib/setup/*.sh; do bash -n "$f"; done
 for f in "$repo"/lib/setup/*.sh; do verify_module "$(basename "$f" .sh)" "$f"; done
-sed 's/# setup-api: 4/# setup-api: 3/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
+sed 's/# setup-api: 5/# setup-api: 4/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
 if (verify_module ssh "$test_dir/stale.sh"); then die 'Stale module API was accepted'; fi
 printf 'PASS: Bash syntax and module API compatibility\n'

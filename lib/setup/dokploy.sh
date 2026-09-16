@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: dokploy
-# setup-api: 4
+# setup-api: 5
 # =============================================================================
 #  Component: dokploy - Install the Dokploy PaaS platform
 #
@@ -43,7 +43,7 @@ fn_dokploy() {
       detail "Would install Dokploy once Docker is present"
       return 0
     fi
-    warn "Docker is not installed, so Dokploy is skipped. Re-run without skipping docker to install both."
+    step_skip "Docker is not installed; enable its component to install both"
     return 0
   fi
 
@@ -63,12 +63,12 @@ fn_dokploy() {
     run docker rm -f dokploy-traefik || true
     sleep 5
   elif has_container_workloads; then
-    warn "Existing container/Swarm host detected; skipping Dokploy to preserve its workloads."
+    step_skip "Existing container/Swarm workloads preserved"
     return 0
   fi
 
   if [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
-    warn "Dokploy cannot be installed inside a Docker/Podman container; skipping."
+    step_skip "Installation is unsupported inside Docker/Podman containers"
     return 0
   fi
 
@@ -78,7 +78,7 @@ fn_dokploy() {
   fi
 
   if ! dokploy_check_ports; then
-    warn "Skipping Dokploy because required ports are occupied. Free 80, 443 and 3000 before re-running."
+    step_skip "Required ports occupied; free 80, 443 and 3000 before retrying"
     return 0
   fi
 

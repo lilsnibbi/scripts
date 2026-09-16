@@ -10,6 +10,13 @@ curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash
 From a checkout: `sudo bash lib/setup.sh`. Preview with `--dry-run`.
 Logs: `journalctl -t server-init`, or standard error without journald.
 
+The console groups machine identity (Linux release, kernel, architecture,
+platform and CT/VM/container classification), the run plan and component results.
+`DONE`, `PLAN`, `SKIP` and `NOTE` distinguish completed work, previews, automatic
+skips and notices. The final summary collects skip reasons, access commands and
+warnings. Detailed command output stays in the journal; the legacy `--verbose`
+option also shows routine explanations on the console.
+
 List everything you can skip:
 
 ```bash
@@ -110,7 +117,7 @@ flow. Optional kernel settings are applied only where supported.
 `https://lilsnibbi.dev/scripts`. The publisher must serve both `setup.sh` and
 `setup/<component>.sh` from the same revision.
 
-Version 3.4 uses **module API 4**. Publish framework/modules together; older
+Version 3.5 uses **module API 5**. Publish framework/modules together; older
 modules are rejected. Name/API/end markers and Bash syntax detect stale or
 truncated files, not malicious code. Module sources execute as root and must be trusted.
 

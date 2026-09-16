@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: swap
-# setup-api: 4
+# setup-api: 5
 # =============================================================================
 #  Component: swap - Create a swapfile when RAM is small and no swap exists
 #
@@ -20,26 +20,26 @@ fn_swap() {
   # A container's swap is whatever the host allots it; swapon is refused there,
   # and the 2 GB file it would take to find that out is pure waste.
   if in_container; then
-    detail "Container detected; swap is allocated by the host"
+    step_skip "Container: swap is managed by the host"
     return 0
   fi
 
   if [ -e /swapfile ] || [ -L /swapfile ] || grep -qE '^/swapfile[[:space:]]' /etc/fstab; then
-    detail "Existing /swapfile or fstab entry preserved; no swapfile created"
+    step_skip "Existing swapfile or fstab entry preserved"
     return 0
   fi
 
   local existing
   existing="$(swapon --show --noheadings 2>/dev/null | wc -l || true)"
   if [ "${existing:-0}" -gt 0 ]; then
-    ok "Swap already configured; leaving it alone"
+    step_skip "Swap already configured"
     return 0
   fi
 
   local mem_mb size_mb
   mem_mb="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
   if [ "$mem_mb" -ge 8192 ]; then
-    ok "${mem_mb} MB of RAM; no swapfile needed"
+    step_skip "${mem_mb} MiB RAM; no swapfile needed"
     return 0
   fi
   size_mb=$((mem_mb < 2048 ? 2048 : mem_mb))

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: firewall
-# setup-api: 4
+# setup-api: 5
 # =============================================================================
 #  Component: firewall - Configure the UFW firewall
 #
@@ -15,7 +15,7 @@ fn_firewall() {
   step "Firewall (UFW)"
 
   if [ "$OPT_RESET_FIREWALL" -eq 0 ] && has_container_workloads; then
-    detail "Existing container host detected; preserving its firewall policy"
+    step_skip "Existing container host: firewall policy preserved"
     return 0
   fi
 
@@ -28,7 +28,7 @@ fn_firewall() {
       case "$port" in 127.*|\[::1\]:*|::1:*) continue ;; esac
       port="${port##*:}"
       case "$port" in 22|80|443|"$OPT_SSH_PORT") continue ;; esac
-      detail "Existing service on port $port detected; preserving firewall policy"
+      step_skip "Existing service on port $port: firewall policy preserved"
       return 0
     done
   fi

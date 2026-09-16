@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: ssh
-# setup-api: 4
+# setup-api: 5
 # =============================================================================
 #  Component: ssh - Create the login account and set the SSH port
 #

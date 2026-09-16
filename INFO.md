@@ -22,6 +22,7 @@ Run on Linux:
 
 ```bash
 bash tests/safety.sh
+bash tests/ui.sh
 sudo bash tests/local-ssh.sh
 sudo bash tests/dokploy-firewall.sh
 shellcheck -S warning -e SC2034,SC1090 lib/setup.sh lib/setup/*.sh tests/*.sh
@@ -33,6 +34,8 @@ sourced test fixtures. Other warning-level diagnostics must pass.
 
 - `safety.sh`: CLI validation, atomic/failed writes, symlinks, Docker/workload
   preservation, rescue passwords, Bash syntax and module compatibility.
+- `ui.sh`: instance classification, 32/48/80/96-column layouts, long identifiers,
+  preview labels, warning summaries and subshell recovery messages.
 - `local-ssh.sh`: real OpenSSH policy checks in a mount namespace; hardware
   gating, LAN scope, key appends, retained ports/socket addresses, reruns,
   dry-run and rollback. Requires root, OpenSSH and mount namespaces.
@@ -71,7 +74,7 @@ configuration. Also run full and selected-component `--dry-run` previews.
 
 ## Release validation
 
-Publish API 4 framework/modules together. Mixed versions must fail before
+Publish API 5 framework/modules together. Mixed versions must fail before
 component changes. Before fleet rollout, exercise fresh setup and reruns on
 disposable Debian/Ubuntu VMs, Proxmox CTs and representative existing hosts.
 Verify IPv4/IPv6 from another machine, reboot persistence, actual systemd

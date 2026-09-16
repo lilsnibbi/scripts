@@ -30,7 +30,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.5.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -46,7 +46,8 @@ SETUP_BASE="${SETUP_BASE:-}"
 # 2: added ui_allow_list, which the dokploy module calls.
 # 3: hardware-gated local_access_enabled, shared by SSH, Dokploy and hardening.
 # 4: atomic fatal-on-error writes, preserved SSH ports and workload detection.
-SETUP_API=4
+# 5: structured progress and step_skip reporting shared by component modules.
+SETUP_API=5
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -192,9 +193,12 @@ color_depth() {
 # deliberate translation of the same eight roles, so the layout reads the same
 # on a truecolor terminal and on a 16-colour one.
 setup_colors() {
+  TTY=0
+  NC='' BOLD='' DIM=''
+  C_TITLE='' C_STEP='' C_OK='' C_WARN='' C_ERR='' C_INFO='' C_MUTED='' C_RULE='' C_BADGE=''
   [ -t 1 ] && TTY=1
   detect_width
-  if [ -n "${NO_COLOR:-}" ] || [ "$OPT_NO_COLOR" -eq 1 ] || [ "$TTY" -eq 0 ]; then
+  if [ "${NO_COLOR+x}" = x ] || [ "$OPT_NO_COLOR" -eq 1 ] || [ "$TTY" -eq 0 ]; then
     return
   fi
 
@@ -284,7 +288,7 @@ detect_width() {
   [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
   # Clamped: narrow terminals still get a usable layout, wide ones do not get a
   # rule stretching halfway across a 4K monitor.
-  [ "$cols" -ge 48 ] || cols=48
+  [ "$cols" -ge 32 ] || cols=32
   [ "$cols" -le 96 ] || cols=96
   TERM_COLS="$cols"
   RULE="$(rule_of $((TERM_COLS - 3)))"
@@ -312,25 +316,48 @@ say() {
   log "[ui] $(strip_ansi "$*")"
 }
 
-info()   { say "   ${C_INFO}${BOLD}›${NC} $*"; }
-# Wraps, but only when it has to. Several callers pass deliberately indented
-# text - a command to copy, say - and running that through the wrapper
-# unconditionally would eat the indent it was given for a reason.
+# Routine chatter belongs in the journal. Verbose mode is still available for
+# diagnostics; the default console keeps one result per component.
+info() { detail "$@"; }
 detail() {
-  local avail=$(( TERM_COLS - 6 ))
-  [ "$avail" -ge 24 ] || avail=24
-  if [ "$(dwidth "$*")" -le "$avail" ]; then
-    say "     ${C_MUTED}$*${NC}"
-    return 0
-  fi
-  log "[ui] $(strip_ansi "$*")"
-  local out
-  while IFS= read -r out; do
-    ui "     ${C_MUTED}${out}${NC}"
-  done < <(wrap_text "$avail" "$*")
+  log "[detail] $*"
+  if [ "$OPT_VERBOSE" -eq 1 ]; then para "$C_MUTED" "$*"; fi
   return 0
 }
-ok()     { say "   ${C_OK}${BOLD}✔${NC} ${C_TITLE}$*${NC}"; }
+ok() {
+  log "[ok] $*"
+  if [ "$OPT_VERBOSE" -eq 1 ]; then para "$C_OK" "$*"; fi
+  return 0
+}
+
+STEP_WARNINGS=0
+STEP_SKIPPED=0
+declare -a AUTO_SKIPPED=()
+
+step_skip() {
+  STEP_SKIPPED=1
+  AUTO_SKIPPED+=("${STEP_TITLE:-$CURRENT_STEP}: $*")
+  log "[skip] ${STEP_TITLE:-$CURRENT_STEP}: $*"
+  return 0
+}
+
+section() {
+  ui ""
+  para "${C_STEP}${BOLD}" "$1"
+  ui "  ${C_RULE}$(rule_of $((TERM_COLS - 4)))${NC}"
+}
+
+clear_progress() {
+  if [ "$TTY" -eq 1 ] && [ "$OPT_VERBOSE" -eq 0 ]; then printf '\r\033[2K' >&3; fi
+  return 0
+}
+
+render_notices() {
+  [ "${#WARNINGS[@]}" -gt 0 ] || return 0
+  section "ATTENTION / ${#WARNINGS[@]}"
+  local item
+  for item in "${WARNINGS[@]}"; do row "!" "$C_WARN" "$item"; done
+}
 
 LABEL_W=9
 
@@ -358,6 +385,13 @@ wrap_text() {
   # Deliberately wrap words, rather than retaining argument boundaries.
   # shellcheck disable=SC2048
   for word in $*; do
+    if [ "$(dwidth "$word")" -gt "$width" ]; then
+      [ -z "$line" ] || { printf '%s\n' "$line"; line=""; }
+      while [ "$(dwidth "$word")" -gt "$width" ]; do
+        printf '%s\n' "${word:0:$width}"
+        word="${word:$width}"
+      done
+    fi
     if [ -z "$line" ]; then
       line="$word"
     elif [ $(( $(dwidth "$line") + 1 + $(dwidth "$word") )) -le "$width" ]; then
@@ -379,7 +413,7 @@ wrap_text() {
 row() {
   local label="$1" col="$2"; shift 2
   local avail=$(( TERM_COLS - 5 - LABEL_W ))
-  [ "$avail" -ge 24 ] || avail=24
+  [ "$avail" -ge 12 ] || avail=12
   local first=1 item out
   for item in "$@"; do
     [ -n "$item" ] || continue
@@ -408,59 +442,61 @@ para() {
   return 0
 }
 
-# Warnings are the longest lines the script emits, and the only ones that
-# routinely overrun the terminal. Wrapping them under a hanging indent keeps
-# them as one visual block instead of spilling back to column zero.
+# Normal notices are grouped at the end; transaction recovery stays immediate.
 warn() {
-  WARNINGS+=("$(strip_ansi "$*")")
-  log "[ui] ! $(strip_ansi "$*")"
-  local avail=$(( TERM_COLS - 6 ))
-  [ "$avail" -ge 24 ] || avail=24
-  local first=1 out
-  while IFS= read -r out; do
-    if [ "$first" -eq 1 ]; then
-      ui "   ${C_WARN}${BOLD}!${NC} ${C_WARN}${out}${NC}"
-      first=0
-    else
-      ui "     ${C_WARN}${out}${NC}"
-    fi
-  done < <(wrap_text "$avail" "$*")
+  log "[warning] $*"
+  # SSH transactions run in a subshell; their arrays cannot reach the parent.
+  # Print those warnings immediately rather than losing recovery instructions.
+  if [ "${BASHPID:-$$}" != "$$" ]; then
+    clear_progress
+    row "!" "$C_WARN" "$*"
+  else
+    WARNINGS+=("${STEP_TITLE:-Preflight}: $(strip_ansi "$*")")
+    if [ "$OPT_VERBOSE" -eq 1 ]; then row "!" "$C_WARN" "$*"; fi
+  fi
   return 0
 }
 
 die() {
+  clear_progress
+  if [ "$OPT_VERBOSE" -eq 0 ]; then render_notices; fi
   ui ""
-  ui "${C_ERR}${BOLD}  ✖ $1${NC}"
+  row "FAILED" "$C_ERR" "$1"
   [ "$LOG_READY" -eq 1 ] && ui "${C_MUTED}    Log: ${LOG_HINT}${NC}"
   ui ""
   log "FATAL: $(strip_ansi "$1")"
   exit "${2:-1}"
 }
 
-# A step header is "[n/N] Title" followed by a rule that fills whatever space
-# the title leaves, so the heading always reaches the right margin.
+# Live terminals retain one result per step. Redirected logs also show starts
+# so a long-running package operation has an identifiable current component.
 step() {
   step_finish
   STEP_INDEX=$((STEP_INDEX + 1))
-  CURRENT_STEP="$1"
-  STEP_TITLE="$1"
-  STEP_T0=$SECONDS
-  local count="${STEP_INDEX}/${STEP_TOTAL}"
-  # The chip renders as " n/N " - one pad column either side of the count.
-  local used=$(( 1 + ${#count} + 2 + 1 + ${#1} + 1 ))
-  local fill=$(( TERM_COLS - used - 1 ))
-  [ "$fill" -ge 0 ] || fill=0
-  # One blank line, and only here. Steps are the unit a reader scans by, so the
-  # air goes between steps rather than inside them.
-  ui ""
-  ui " ${C_BADGE} ${count} ${NC} ${C_TITLE}${BOLD}$1${NC} ${C_RULE}$(rule_of "$fill")${NC}"
+  CURRENT_STEP="$1" STEP_TITLE="$1" STEP_T0=$SECONDS
+  STEP_WARNINGS=${#WARNINGS[@]} STEP_SKIPPED=0
   log "=== STEP ${STEP_INDEX}/${STEP_TOTAL}: $1 ==="
+  if [ "$TTY" -eq 1 ] && [ "$OPT_VERBOSE" -eq 0 ]; then
+    spin_draw "·" "$1" ""
+  elif [ "$OPT_DRY_RUN" -eq 0 ] || [ "$OPT_VERBOSE" -eq 1 ]; then
+    row "$(printf '%02d/%02d' "$STEP_INDEX" "$STEP_TOTAL")" "$C_MUTED" "RUN $1"
+  fi
 }
 
-# Close the open step and record its duration for the summary's timing line.
 step_finish() {
   [ -n "$STEP_TITLE" ] || return 0
-  STEP_TIMES+=("${STEP_TITLE}|$((SECONDS - STEP_T0))")
+  local elapsed=$((SECONDS - STEP_T0)) status="DONE" col="$C_OK" timing=""
+  if [ "$elapsed" -ge 5 ]; then timing=" / $(fmt_secs "$elapsed")"; fi
+  STEP_TIMES+=("${STEP_TITLE}|$elapsed")
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then status="PLAN"; col="$C_INFO"; fi
+  if [ "$STEP_SKIPPED" -eq 1 ]; then status="SKIP"; col="$C_MUTED";
+  elif [ "${#WARNINGS[@]}" -gt "$STEP_WARNINGS" ]; then status="NOTE"; col="$C_WARN"; fi
+  clear_progress
+  if { [ "$TTY" -eq 1 ] || [ "$OPT_DRY_RUN" -eq 1 ]; } && [ "$OPT_VERBOSE" -eq 0 ]; then
+    row "$(printf '%02d/%02d' "$STEP_INDEX" "$STEP_TOTAL")" "$col" "$status  $STEP_TITLE$timing"
+  else
+    printf '         %b%s%b  %s\n' "$col" "$status" "$NC" "$(fmt_secs "$elapsed")" >&3
+  fi
   STEP_TITLE=""
   return 0
 }
@@ -476,7 +512,9 @@ on_error() {
     exit "$rc"
   fi
   ui ""
-  ui "${C_ERR}${BOLD}  ✖ Failed during: ${CURRENT_STEP}${NC}"
+  clear_progress
+  if [ "$OPT_VERBOSE" -eq 0 ]; then render_notices; fi
+  row "FAILED" "$C_ERR" "$CURRENT_STEP"
   ui "${C_ERR}    exit ${rc} at line ${line}${NC}"
   if [ "$LOG_READY" -eq 1 ] && have journalctl; then
     # Let systemd-cat drain what is still sitting in the pipe before asking
@@ -1268,6 +1306,7 @@ preflight() {
   esac
 
   banner
+  row "Preflight" "$C_MUTED" "Checking access, packages and readiness..."
   resolve_local_access
 
   # A Proxmox CT is a normal target, so a container is a note, not a warning.
@@ -1290,34 +1329,67 @@ preflight() {
   bootstrap_packages
 }
 
-banner() {
-  local mem_total disk_free
-  mem_total="$(awk '/MemTotal/ {printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")"
-  disk_free="$(df -h / | awk 'NR==2 {print $4 " free of " $2}' 2>/dev/null || echo "unknown")"
+# Classification is for display only. Security gates continue to use their
+# existing fail-closed probes; unavailable evidence is labelled Unknown.
+detect_instance() {
+  INSTANCE_TYPE="Unknown" INSTANCE_PLATFORM="Unknown"
+  local virt rc=0 vendor model
+  if virt="$(systemd-detect-virt 2>/dev/null)"; then
+    case "$virt" in
+      lxc|lxc-libvirt) INSTANCE_TYPE="CT / system container" ;;
+      docker|podman|container-other|systemd-nspawn|openvz) INSTANCE_TYPE="Container" ;;
+      wsl) INSTANCE_TYPE="WSL / Linux subsystem" ;;
+      *)
+        if systemd-detect-virt --container >/dev/null 2>&1; then INSTANCE_TYPE="Container";
+        else INSTANCE_TYPE="VM / virtual machine"; fi ;;
+    esac
+    INSTANCE_PLATFORM="$virt"
+  else
+    rc=$?
+    if [ "$rc" -eq 1 ] && [ "$virt" = none ]; then
+      INSTANCE_TYPE="Bare metal"
+    elif [ -e /.dockerenv ]; then INSTANCE_TYPE="Container"; INSTANCE_PLATFORM="Docker";
+    elif [ -e /run/.containerenv ]; then INSTANCE_TYPE="Container"; INSTANCE_PLATFORM="Podman"; fi
+  fi
+  # DMI in containers can describe the host, not the guest: never present it
+  # as the CT's provider. LXC alone does not establish that Proxmox is in use.
+  case "$INSTANCE_TYPE" in
+    'Bare metal'|'VM / virtual machine')
+      vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+      model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+      case "$vendor" in ''|'To Be Filled By O.E.M.'|'Default string') vendor='' ;; esac
+      case "$model" in ''|'To Be Filled By O.E.M.'|'Default string') model='' ;; esac
+      if [ "$virt" = none ]; then virt=''; fi
+      if [ -n "$vendor$model" ]; then INSTANCE_PLATFORM="${vendor}${vendor:+ }${model}${virt:+ / $virt}"; fi ;;
+  esac
+}
 
-  # Title and rule share one line; the facts pack into a few rows.
-  local title="${SCRIPT_NAME} v${SCRIPT_VERSION}"
-  local fill=$(( TERM_COLS - ${#title} - 3 ))
-  [ "$fill" -ge 0 ] || fill=0
+banner() {
+  local mem_total disk_free skip_list="" name mode="APPLY"
+  mem_total="$(awk '/MemTotal/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo unknown)"
+  disk_free="$(df -h / | awk 'NR==2 {print $4 " available / " $2}' 2>/dev/null || echo unknown)"
+  [ "$OPT_DRY_RUN" -eq 0 ] || mode="PREVIEW / no changes"
+  detect_instance
   ui ""
-  ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC} ${C_STEP}$(rule_heavy "$fill")${NC}"
-  row "System" "" "$OS_PRETTY ($ARCH) · $(uname -r)"
-  row "Host" "" "$(hostname) · ${mem_total} RAM · ${disk_free}"
-  local target="user ${OPT_USERNAME} · ssh port ${OPT_SSH_PORT}"
-  [ "$OPT_TIMEZONE" = "keep" ] || target="${target} · ${OPT_TIMEZONE}"
-  row "Target" "" "$target"
-  row "Modules" "$C_MUTED" "$SETUP_BASE"
-  row "Log" "$C_MUTED" "$LOG_HINT"
-  if [ ${#SKIPPED[@]} -gt 0 ]; then
-    local skip_list="" name
-    for name in "${SKIPPED[@]}"; do
-      if [ -z "$skip_list" ]; then skip_list="$name"; else skip_list="${skip_list} · ${name}"; fi
-    done
-    row "Skipped" "$C_MUTED" "$skip_list"
-  fi
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    row "Mode" "$C_WARN" "DRY RUN — no changes will be made"
-  fi
+  local inner=$((TERM_COLS - 6)) gap=$((TERM_COLS - 20 - ${#SCRIPT_VERSION}))
+  [ "$gap" -ge 1 ] || gap=1
+  ui "  ${C_STEP}╭$(rule_of "$inner")╮${NC}"
+  printf '  %b│%b %bSERVER INIT%b%*s%bv%s%b %b│%b\n' "$C_STEP" "$NC" "$BOLD$C_TITLE" "$NC" "$gap" '' "$C_MUTED" "$SCRIPT_VERSION" "$NC" "$C_STEP" "$NC" >&3
+  printf '  %b│%b %b%-*s%b %b│%b\n' "$C_STEP" "$NC" "$C_INFO" "$((inner - 2))" "$mode" "$NC" "$C_STEP" "$NC" >&3
+  ui "  ${C_STEP}╰$(rule_of "$inner")╯${NC}"
+  section "MACHINE"
+  row "Host" "$C_TITLE" "$(hostname)"
+  row "Linux" "$C_TITLE" "$OS_PRETTY"
+  row "Instance" "$C_INFO" "$INSTANCE_TYPE"
+  row "Platform" "" "$INSTANCE_PLATFORM"
+  row "Kernel" "$C_MUTED" "$(uname -r)"
+  row "Resources" "" "${ARCH} / ${mem_total} RAM / $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?') CPUs" "$disk_free disk"
+  section "RUN PLAN"
+  row "Account" "" "${OPT_USERNAME} / SSH ${OPT_SSH_PORT} / timezone ${OPT_TIMEZONE}"
+  row "Selected" "$C_TITLE" "${#TO_RUN[@]} of ${#COMPONENTS[@]} components"
+  for name in "${SKIPPED[@]}"; do skip_list="${skip_list}${skip_list:+, }$name"; done
+  row "Skipped" "$C_MUTED" "${skip_list:-None}"
+  if [ "$OPT_VERBOSE" -eq 1 ]; then row "Source" "$C_MUTED" "$SETUP_BASE"; fi
 }
 
 # =============================================================================
@@ -1368,78 +1440,41 @@ step_times_list() {
 }
 
 summary() {
-  local elapsed=$((SECONDS - START_TIME))
-  local nwarn=${#WARNINGS[@]}
-  local plural="s"
-  [ "$nwarn" -eq 1 ] && plural=""
-
-  # Green when the run was clean, amber when it was not: the tail of a captured
-  # log answers "did anything go sideways?" before anyone scrolls.
-  local bar barcol="$C_OK"
-  bar="Setup complete in $(fmt_secs "$elapsed")"
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then bar="Preview complete in $(fmt_secs "$elapsed")"; fi
-  if [ "$nwarn" -gt 0 ]; then
-    bar="${bar} — ${nwarn} warning${plural}"
-    barcol="$C_WARN"
+  local elapsed=$((SECONDS - START_TIME)) title="COMPLETE" item
+  local col="$C_OK" skip_list=""
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then title="PREVIEW COMPLETE"; col="$C_INFO"; fi
+  if [ "${#WARNINGS[@]}" -gt 0 ]; then col="$C_WARN"; fi
+  section "$title"
+  row "Result" "$col" "${STEP_TOTAL} reviewed / $(fmt_secs "$elapsed") / ${#WARNINGS[@]} notices"
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then row "Changes" "$C_INFO" "None. This was a preview."; fi
+  if [ "$OPT_DRY_RUN" -eq 0 ]; then
+    local installed
+    installed="$(installed_list)"
+    if [ -n "$installed" ]; then row "Installed" "$C_TITLE" "$installed"; fi
   fi
-  local fill=$(( TERM_COLS - $(dwidth "$bar") - 6 ))
-  [ "$fill" -ge 0 ] || fill=0
-  ui ""
-  ui " ${barcol}${BOLD}━━ ${bar} $(rule_heavy "$fill")${NC}"
-  ui ""
-
-  # Everything else the old summary repeated - each version, the SSH settings,
-  # the next steps - was already said once, in the step that did the work. What
-  # is left is the roll call, the timing, the addresses and the warnings,
-  # because those are the only things a reader has to carry away from the run.
-  para "" "$(installed_list)"
-  local times
-  times="$(step_times_list)"
-  [ -n "$times" ] && row "Time" "$C_MUTED" "$times"
-  ui ""
-
-  if [ -n "$PUBLIC_IP" ]; then
-    row "Connect" "$C_INFO" "ssh -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
-    is_private_ip "$PUBLIC_IP" && row "" "$C_MUTED" "that is a private address — reachable from this network only" || true
+  for item in "${SKIPPED[@]}"; do skip_list="${skip_list}${skip_list:+, }$item"; done
+  if [ -n "$skip_list" ]; then row "Excluded" "$C_MUTED" "$skip_list"; fi
+  if [ "${#AUTO_SKIPPED[@]}" -gt 0 ]; then
+    section "NOT APPLIED / AUTOMATIC SKIPS"
+    for item in "${AUTO_SKIPPED[@]}"; do row "Skipped" "$C_MUTED" "$item"; done
+  fi
+  if [ "$OPT_DRY_RUN" -eq 0 ] && [ -n "$PUBLIC_IP" ]; then
+    section "ACCESS"
+    row "SSH" "$C_INFO" "ssh -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
     if [ "$DOKPLOY_INSTALLED" -eq 1 ]; then
-      local allow
-      allow="$(ui_allow_list)"
-      if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
+      if [ "$OPT_UI_PUBLIC" -eq 1 ] || [ -n "$(ui_allow_list)" ]; then
         row "Dokploy" "$C_INFO" "http://${PUBLIC_IP}:3000"
-        row "" "$C_WARN" "open to the internet — claim the admin account now"
-      elif [ -n "$allow" ]; then
-        row "Dokploy" "$C_INFO" "http://${PUBLIC_IP}:3000"
-        row "" "$C_MUTED" "reachable from ${allow} only"
       else
-        row "Dokploy" "$C_INFO" "ssh -L 3000:localhost:3000 -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
-        row "" "$C_MUTED" "then open http://localhost:3000 (port 3000 is closed)"
+        row "Tunnel" "$C_INFO" "ssh -L 3000:localhost:3000 -p ${OPT_SSH_PORT} ${OPT_USERNAME}@${PUBLIC_IP}"
+        row "Browser" "" "http://localhost:3000"
       fi
     fi
   fi
-  row "Log" "$C_MUTED" "$LOG_HINT"
-
-  # The warnings again, in one place. During the run each one scrolled past
-  # inside its own step; an unattended log is read from the tail, so the recap
-  # has to be the last thing printed.
-  if [ "$nwarn" -gt 0 ]; then
-    ui ""
-    ui "   ${C_WARN}${BOLD}!${NC} ${C_TITLE}${BOLD}${nwarn} warning${plural} from this run${NC}"
-    local w out first avail=$(( TERM_COLS - 9 ))
-    [ "$avail" -ge 24 ] || avail=24
-    for w in ${WARNINGS[@]+"${WARNINGS[@]}"}; do
-      first=1
-      while IFS= read -r out; do
-        if [ "$first" -eq 1 ]; then
-          ui "     ${C_WARN}·${NC} ${C_WARN}${out}${NC}"
-          first=0
-        else
-          ui "       ${C_WARN}${out}${NC}"
-        fi
-      done < <(wrap_text "$avail" "$w")
-    done
-  fi
+  if [ "$OPT_VERBOSE" -eq 0 ]; then render_notices; fi
   ui ""
-  log "RESULT: success warnings=${nwarn} elapsed=${elapsed}s"
+  row "Log" "$C_MUTED" "$LOG_HINT"
+  ui ""
+  log "RESULT: success warnings=${#WARNINGS[@]} elapsed=${elapsed}s"
 }
 
 # The address to print in the connect command.
@@ -1582,6 +1617,7 @@ main() {
   # Needed by fn_bun and the summary even when the ssh component is skipped.
   resolve_user_home
 
+  section "COMPONENTS"
   local name
   for name in "${TO_RUN[@]}"; do
     "fn_${name}"

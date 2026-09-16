@@ -195,7 +195,7 @@ unset -f have
 have() { command -v "$1" >/dev/null 2>&1; }
 for file in "$repo/lib/setup.sh" "$repo"/lib/setup/*.sh "$repo"/tests/*.sh; do bash -n "$file"; done
 for file in "$repo"/lib/setup/*.sh; do verify_module "$(basename "$file" .sh)" "$file"; done
-sed 's/# setup-api: 4/# setup-api: 3/' "$repo/lib/setup/docker.sh" >"$test_dir/stale"
+sed 's/# setup-api: 5/# setup-api: 4/' "$repo/lib/setup/docker.sh" >"$test_dir/stale"
 reject verify_module docker "$test_dir/stale"
 head -n -2 "$repo/lib/setup/docker.sh" >"$test_dir/truncated"
 reject verify_module docker "$test_dir/truncated"
