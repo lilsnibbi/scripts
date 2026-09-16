@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: tuning
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: tuning - Performance tuning: network stack, limits, power, CPU
 #  governor

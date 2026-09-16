@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: swap
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: swap - Create a swapfile when RAM is small and no swap exists
 #

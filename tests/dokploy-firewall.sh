@@ -2,6 +2,9 @@
 # Run as root with iptables/ip6tables and Python installed. Network and mount
 # namespaces isolate every rule and unit write; Docker is not required.
 set -Eeuo pipefail
+for cmd in iptables ip6tables iptables-restore ip6tables-restore ip curl python3; do
+  command -v "$cmd" >/dev/null || { echo "Missing test dependency: $cmd" >&2; exit 1; }
+done
 if [ "${1:-}" != --isolated ]; then
   exec unshare --mount --net --propagation private bash "$0" --isolated
 fi
@@ -23,7 +26,7 @@ ok() { :; }
 warn() { :; }
 systemctl() {
   case "$1" in
-    restart) /usr/local/sbin/dokploy-ui-firewall ;;
+    reload-or-restart) /usr/local/sbin/dokploy-ui-firewall ;;
     *) return 0 ;;
   esac
 }

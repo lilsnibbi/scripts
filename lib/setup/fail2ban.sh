@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: fail2ban
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: fail2ban - Install and pre-configure fail2ban for SSH
 #
@@ -41,7 +41,7 @@ ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled  = true
-port     = $OPT_SSH_PORT
+port     = $(printf '%s\n' "${SSH_LISTEN_PORTS:-$OPT_SSH_PORT}" | paste -sd, -)
 maxretry = 3
 bantime  = 1h
 
@@ -66,11 +66,22 @@ CONF
   # The recidive jail reads fail2ban's own log file, so it must exist.
   run touch /var/log/fail2ban.log
 
-  run systemctl enable fail2ban || true
+  run systemctl enable fail2ban || die "Could not enable fail2ban."
   if run systemctl restart fail2ban; then
-    ok "fail2ban active, watching SSH on port $OPT_SSH_PORT"
+    FAIL2BAN_CONFIGURED=1
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+      local attempt
+      for attempt in {1..10}; do
+        if timeout 3 fail2ban-client status sshd >&4 2>&1; then
+          ok "fail2ban SSH jail is active"
+          return 0
+        fi
+        sleep 1
+      done
+      die "fail2ban started but its SSH jail is unavailable. See 'journalctl -u fail2ban'."
+    fi
   else
-    warn "fail2ban failed to start. See 'journalctl -u fail2ban'."
+    die "fail2ban failed to start. See 'journalctl -u fail2ban'."
   fi
 }
 

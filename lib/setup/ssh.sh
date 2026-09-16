@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: ssh
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: ssh - Create the login account and set the SSH port
 #
@@ -215,6 +215,7 @@ ssh_local_config() {
 # Run in a subshell so this transaction's traps cannot replace framework traps.
 ssh_configure() (
   local ours=/etc/ssh/sshd_config.d/00-server-init.conf
+  local auth=/etc/ssh/sshd_config.d/00-server-init-auth.conf
   local main=/etc/ssh/sshd_config
   local snapshot="" committed=0 restarting=0 f i content err rc=0 restore_failed=0
   local -a paths=()
@@ -227,9 +228,9 @@ ssh_configure() (
     if ! err="$(sshd -t 2>&1)"; then
       die "Existing sshd configuration is invalid; SSH was not changed: $err"
     fi
-    paths=("$main" "$ours" /etc/systemd/system/ssh.socket.d/10-port.conf)
+    paths=("$main" "$ours" "$auth" /etc/systemd/system/ssh.socket.d/10-port.conf)
     for f in /etc/ssh/sshd_config.d/*.conf; do
-      [ -f "$f" ] && [ "$f" != "$ours" ] && paths+=("$f")
+      [ -f "$f" ] && [ "$f" != "$ours" ] && [ "$f" != "$auth" ] && paths+=("$f")
     done
     for f in "${paths[@]}"; do
       [ ! -L "$f" ] || die "Refusing to rewrite symlinked SSH configuration: $f"
@@ -273,9 +274,20 @@ ssh_configure() (
     trap 'exit 143' TERM
   fi
 
-  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ] || [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then
     ssh_ensure_include
+  fi
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then
     ssh_neutralise_conflicts "$ours"
+  fi
+
+  if [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then
+    ssh_write_file "$auth" 0644 '# Managed by setup.sh. Explicit --ssh-key-only policy.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitRootLogin prohibit-password'
   fi
 
   # Global port settings must stay outside the conditional LAN policy.
@@ -307,6 +319,7 @@ CONF
     if local_access_enabled; then
       ssh_validate_local_policy
     fi
+    if [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then ssh_validate_key_policy; fi
     detail "sshd configuration validated"
   elif local_access_enabled; then
     detail "Would enable RFC1918 SSH password login for '$OPT_USERNAME'"
@@ -341,6 +354,27 @@ CONF
   ssh_restart
   committed=1
 )
+
+ssh_validate_key_policy() {
+  local addr effective root_policy connection="${SSH_CONNECTION:-}"
+  # Include the current source when available; representative addresses also
+  # catch common Match blocks. No local check proves real authentication.
+  for addr in 198.51.100.1 10.0.0.1 2001:db8::1 ${connection%% *}; do
+    effective="$(sshd -T -C "user=$OPT_USERNAME,addr=$addr,host=$addr" 2>&1)" \
+      || die "Could not evaluate key-only SSH policy: $effective"
+    grep -qx 'pubkeyauthentication yes' <<<"$effective" \
+      && grep -qx 'passwordauthentication no' <<<"$effective" \
+      && grep -qx 'kbdinteractiveauthentication no' <<<"$effective" \
+      && grep -qx 'authenticationmethods publickey' <<<"$effective" \
+      || die "Existing SSH configuration overrides the requested key-only policy for $addr."
+    root_policy="$(sshd -T -C "user=root,addr=$addr,host=$addr" 2>&1)" \
+      || die "Could not evaluate root SSH policy."
+    grep -qEx 'permitrootlogin (prohibit-password|without-password)' <<<"$root_policy" \
+      && grep -qx 'pubkeyauthentication yes' <<<"$root_policy" \
+      && grep -qx 'authenticationmethods publickey' <<<"$root_policy" \
+      || die "Existing SSH configuration prevents the requested root key access for Dokploy at $addr."
+  done
+}
 
 ssh_validate_local_policy() {
   local addr effective
@@ -377,8 +411,14 @@ fn_ssh() {
     if [ "$OPT_DRY_RUN" -eq 0 ] && [ "$(passwd -S "$OPT_USERNAME" | awk '{print $2}')" != P ]; then
       warn "'$OPT_USERNAME' needs an unlocked password: run 'sudo passwd $OPT_USERNAME'. No password was set or unlocked by setup."
     fi
+  elif [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then
+    ok "sshd listening on port $OPT_SSH_PORT (keys required; root keys permitted)"
   else
     ok "sshd listening on port $OPT_SSH_PORT (system authentication preserved)"
+  fi
+
+  if [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then
+    warn "SSH now requires keys; root key login remains available for Dokploy. Keep this session and provider console access until a new $OPT_USERNAME login works."
   fi
 
   if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then

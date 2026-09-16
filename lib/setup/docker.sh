@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: docker
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: docker - Install Docker CE with container log rotation
 #
@@ -22,6 +22,7 @@ fn_docker() {
   # rewrite/restart a daemon serving existing containers.
   if have docker; then
     if docker version >/dev/null 2>&1; then
+      DOCKER_REQUIRED=1
       ok "Existing Docker-compatible runtime preserved"
       return 0
     fi
@@ -77,6 +78,7 @@ fn_docker() {
   run systemctl enable docker || true
   run systemctl start docker \
     || die "Docker failed to start. In a Proxmox LXC container this needs the 'nesting' feature (and 'keyctl' when unprivileged). See: ${LOG_HINT}"
+  DOCKER_REQUIRED=1
 
   if [ "$OPT_USERNAME" != "root" ]; then
     run usermod -aG docker "$OPT_USERNAME" || true

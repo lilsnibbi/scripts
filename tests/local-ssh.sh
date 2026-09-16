@@ -2,6 +2,7 @@
 # Run on Linux with OpenSSH installed: sudo bash tests/local-ssh.sh
 # All /etc/ssh, systemd unit and /run writes are isolated by mount namespace.
 set -Eeuo pipefail
+command -v sshd >/dev/null || { echo 'OpenSSH server is required for this test.' >&2; exit 1; }
 if [ "${1:-}" != --isolated ]; then
   [ "$(id -u)" -eq 0 ] || { echo 'Run as root (mount namespace required).' >&2; exit 1; }
   exec unshare --mount --propagation private bash "$0" --isolated
@@ -226,8 +227,33 @@ lock_root_password
 unset -f passwd
 printf 'PASS: dry-run and password preservation\n'
 
+# Explicit key-only mode must reject passwords but retain Dokploy's root key
+# access, persist on default reruns, and roll back on conflicting policy.
+reset_config
+LOCAL_ACCESS_ENABLED=0 OPT_SSH_KEY_ONLY=1 OPT_USERNAME=nobody OPT_DRY_RUN=0
+sed -i '/^PasswordAuthentication /d; /^PubkeyAuthentication /d; /^PermitRootLogin /d; /^AuthenticationMethods /d' /etc/ssh/sshd_config
+ssh_configure
+for addr in 198.51.100.1 10.0.0.1 2001:db8::1; do
+  expect_policy nobody "$addr" 'passwordauthentication no'
+  expect_policy nobody "$addr" 'kbdinteractiveauthentication no'
+  expect_policy nobody "$addr" 'authenticationmethods publickey'
+  assert grep -qEx 'permitrootlogin (prohibit-password|without-password)' < <(policy root "$addr")
+done
+OPT_SSH_KEY_ONLY=0
+ssh_configure
+expect_policy nobody 198.51.100.1 'passwordauthentication no'
+reset_config
+OPT_SSH_KEY_ONLY=1 LOCAL_ACCESS_ENABLED=0 OPT_USERNAME=nobody
+cp -p /etc/ssh/sshd_config "$test_dir/key-only-before"
+printf 'Match User nobody\n PasswordAuthentication yes\n' >/etc/ssh/sshd_config.d/00-aaa.conf
+if (ssh_configure); then die 'Conflicting key-only policy was accepted'; fi
+assert cmp /etc/ssh/sshd_config "$test_dir/key-only-before"
+assert test ! -e /etc/ssh/sshd_config.d/00-server-init-auth.conf
+OPT_SSH_KEY_ONLY=0
+printf 'PASS: key-only policy retains Dokploy root key access, persistence and rollback\n'
+
 for f in "$repo/lib/setup.sh" "$repo"/lib/setup/*.sh; do bash -n "$f"; done
 for f in "$repo"/lib/setup/*.sh; do verify_module "$(basename "$f" .sh)" "$f"; done
-sed 's/# setup-api: 5/# setup-api: 4/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
+sed 's/# setup-api: 6/# setup-api: 5/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
 if (verify_module ssh "$test_dir/stale.sh"); then die 'Stale module API was accepted'; fi
 printf 'PASS: Bash syntax and module API compatibility\n'

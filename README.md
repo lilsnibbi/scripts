@@ -75,7 +75,7 @@ No password is created or unlocked. Use `--ui=CIDR` on servers.
 
 ## Options
 
-The main CLI has nine options. Defaults handle everything else.
+The main CLI has twelve options. Defaults handle everything else.
 
 | Option | Purpose |
 | :--- | :--- |
@@ -85,6 +85,9 @@ The main CLI has nine options. Defaults handle everything else.
 | `--username=NAME` | Login account; default `root`. New accounts receive passwordless sudo. |
 | `--pubkey="ssh-..."` | Validate and append a public key. |
 | `--ssh-port=N` | Change the SSH port; otherwise preserve existing ports. |
+| `--ssh-key-only` | Require a supplied key; disable SSH passwords, retain root key login for Dokploy. |
+| `--lockdown-interface=IFACE[,IFACE]` | Block public service ingress on named interfaces, including Docker-published ports. |
+| `--ssh-allow=CIDR[,CIDR]\|none` | IPv4 SSH source allowlist for lockdown; `none` blocks public SSH too. |
 | `--ui=ACCESS` | `tunnel` (default), IPv4 CIDRs, `public`, or `local`. |
 | `--help` | Show compact usage. |
 | `--version` | Show version. |
@@ -94,6 +97,43 @@ Older flags remain accepted for existing automation; see [compatibility](INFO.md
 A new non-root account needs a supplied key or a separately set password before
 login. After an explicit port change, verify a new SSH session before disconnecting;
 provider firewalls must also permit it. Local checks cannot prove remote access.
+
+## Dedicated server behind Cloudflare Tunnel
+
+Use the reviewed **local checkout** with its matching modules. Since SSH is
+already configured, skip its component. For initial setup over your existing
+public SSH connection, replace the interface and address placeholders:
+
+```bash
+sudo bash lib/setup.sh --base="$PWD/lib" \
+  --lockdown-interface=PUBLIC_INTERFACE \
+  --ssh-allow=YOUR_ADMIN_PUBLIC_IPV4/32 \
+  --ui=tunnel --skip=ssh,bun,cloudflared,tuning
+```
+
+Add `--dry-run` to preview first. `ip -br address` helps identify interfaces;
+include every interface carrying public traffic, including IPv6. This command
+leaves only allowlisted public IPv4 SSH, established replies and network control
+traffic. Application ports are blocked before Docker destination translation.
+Use a provider firewall with the same restrictions from the start.
+
+For **no public SSH**, use `--ssh-allow=none` from the provider console or after
+establishing private management. A run from a detected public SSH session rejects
+`none`; existing sessions surviving a firewall change do not prove reconnects work.
+The website tunnel does not itself create a private SSH management path.
+
+`--ui=tunnel` protects Dokploy's host port 3000; it does not create a Cloudflare
+Tunnel. Follow [Dokploy's container connector guide](https://docs.dokploy.com/docs/core/guides/cloudflare-tunnels)
+using internal service names. Host Bun/cloudflared and performance tuning are
+unnecessary for this deployment, hence the skips above.
+
+The script leaves existing SSH authentication, keys, ports and forwarding alone.
+The firewall discovers configured SSH/socket ports and preserves Docker gateway
+SSH for Dokploy's local terminal. Dokploy's generated public key still needs
+authorising using its normal setup instructions.
+Lockdown assumes a single server; public Swarm peers and public VPN listeners
+would need a separately designed policy. See [the production audit](PRODUCTION-AUDIT.md)
+for exact effects, testing evidence and remaining deployment checks.
 
 ## Components
 
@@ -117,7 +157,7 @@ flow. Optional kernel settings are applied only where supported.
 `https://lilsnibbi.dev/scripts`. The publisher must serve both `setup.sh` and
 `setup/<component>.sh` from the same revision.
 
-Version 3.5 uses **module API 5**. Publish framework/modules together; older
+Version 3.6 uses **module API 6**. Publish framework/modules together; older
 modules are rejected. Name/API/end markers and Bash syntax detect stale or
 truncated files, not malicious code. Module sources execute as root and must be trusted.
 

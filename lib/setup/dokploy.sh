@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: dokploy
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: dokploy - Install the Dokploy PaaS platform
 #
@@ -10,6 +10,9 @@
 #  Must define fn_dokploy. The last line must be the end-of-module marker.
 # =============================================================================
 [ -n "${SETUP_API:-}" ] || { echo "This is a setup.sh component module; run setup.sh instead." >&2; exit 64; }
+
+DOKPLOY_RELEASE=v0.30.6
+DOKPLOY_INSTALLER_SHA256=ea698c22abcfa1e3e7164380e46f918149e2663088a594904b1ae4b7352878eb
 
 dokploy_is_installed() {
   have docker || return 1
@@ -54,6 +57,8 @@ fn_dokploy() {
       detail "Use Dokploy's documented update procedure to upgrade"
       DOKPLOY_INSTALLED=1
       restrict_dokploy_ui
+      harden_dokploy_directory
+      wait_for_dokploy
       return 0
     fi
     warn "Reinstalling Dokploy: Docker Swarm will be left and re-initialised."
@@ -90,10 +95,17 @@ fn_dokploy() {
   fi
 
   local installer
+  [ ! -L /etc/dokploy ] || die "Refusing a symlinked Dokploy configuration directory."
   installer="$(mktemp)"
   run_spin "Downloading the Dokploy installer" \
-    retry curl -fsSL --connect-timeout 20 --max-time 120 https://dokploy.com/install.sh -o "$installer" \
+    retry curl -fsSL --connect-timeout 20 --max-time 120 \
+      "https://github.com/Dokploy/dokploy/releases/download/${DOKPLOY_RELEASE}/install.sh" -o "$installer" \
     || { rm -f "$installer"; die "Could not download the Dokploy installer."; }
+
+  if ! printf '%s  %s\n' "$DOKPLOY_INSTALLER_SHA256" "$installer" | sha256sum -c - >&4 2>&1; then
+    rm -f "$installer"
+    die "Dokploy installer checksum mismatch; refusing to run changed upstream code."
+  fi
 
   # Sanity check: a captive portal or error page must not be piped into a shell.
   if ! head -n1 "$installer" | grep -q '^#!' || ! bash -n "$installer"; then
@@ -105,33 +117,62 @@ fn_dokploy() {
   restrict_dokploy_ui
 
   info "Running the Dokploy installer (pulls several images; expect 2-5 minutes)"
-  if run_spin "Installing Dokploy" bash "$installer"; then
-    DOKPLOY_INSTALLED=1
-    ok "Dokploy installed"
-  else
+  if ! run_spin "Installing Dokploy" env DOKPLOY_VERSION="$DOKPLOY_RELEASE" bash "$installer"; then
     rm -f "$installer"
     die "The Dokploy installer failed. See: ${LOG_HINT}"
   fi
   rm -f "$installer"
 
+  harden_dokploy_directory
   wait_for_dokploy
+  DOKPLOY_INSTALLED=1
+  ok "Dokploy services and proxy are ready"
   restrict_dokploy_ui
 }
 
-# The swarm service needs a moment to pull and start. Confirming the UI answers
-# turns a silent half-finished install into a visible warning.
+harden_dokploy_directory() {
+  [ "$OPT_DRY_RUN" -eq 0 ] || return 0
+  [ -d /etc/dokploy ] && [ ! -L /etc/dokploy ] \
+    || die "Dokploy configuration directory is missing or symlinked."
+  [ "$(stat -c %u /etc/dokploy)" = 0 ] || die "Dokploy configuration directory must be owned by root."
+  # The upstream installer creates this directory with mode 777.
+  run chmod go-w /etc/dokploy || die "Could not remove unsafe Dokploy directory write permissions."
+}
+
+dokploy_services_ready() {
+  local service replicas running desired db
+  for service in dokploy dokploy-postgres; do
+    replicas="$(timeout 10 docker service ls --filter "name=$service" --format '{{.Name}} {{.Replicas}}' 2>/dev/null \
+      | awk -v name="$service" '$1 == name {print $2}')" || return 1
+    [[ "$replicas" =~ ^[0-9]+/[0-9]+$ ]] || return 1
+    running="${replicas%/*}" desired="${replicas#*/}"
+    [ "$desired" -gt 0 ] && [ "$running" -eq "$desired" ] || return 1
+  done
+  [ "$(timeout 10 docker inspect --format '{{.State.Running}}' dokploy-traefik 2>/dev/null)" = true ] || return 1
+  db="$(timeout 10 docker ps --filter label=com.docker.swarm.service.name=dokploy-postgres \
+    --filter status=running --format '{{.ID}}' 2>/dev/null)" || return 1
+  [[ "$db" =~ ^[a-f0-9]+$ ]] || return 1
+  timeout 10 docker exec "$db" pg_isready -U dokploy -d dokploy >&4 2>&1 || return 1
+  curl -fsS --noproxy '*' --max-time 3 -o /dev/null http://127.0.0.1:3000/api/trpc/settings.health 2>/dev/null || return 1
+  # A Traefik 404 with no routes is healthy; a failed connection or 5xx is not.
+  local code
+  code="$(curl -sS --noproxy '*' --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:80 2>/dev/null)" || return 1
+  [[ "$code" =~ ^[234][0-9][0-9]$ ]]
+}
+
+# Upstream can exit zero after failed docker create/run commands. Its exit code
+# is not a health check; require the database, application and proxy outcomes.
 wait_for_dokploy() {
-  local waited=0
-  while [ $waited -lt 90 ]; do
-    if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:3000 2>/dev/null; then
-      ok "Dokploy UI responding on port 3000"
+  [ "$OPT_DRY_RUN" -eq 0 ] || return 0
+  local deadline=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if dokploy_services_ready; then
+      ok "Dokploy, PostgreSQL and Traefik readiness verified"
       return 0
     fi
     sleep 5
-    waited=$((waited + 5))
   done
-  warn "Dokploy did not answer on port 3000 within 90s. Check 'docker service ls' and 'docker service logs dokploy'."
-  return 0
+  die "Dokploy is incomplete or unhealthy. Check 'docker service ls', service logs and 'docker logs dokploy-traefik'. Existing data was preserved; repair the partial installation before retrying."
 }
 
 # Filter local-destination traffic before Docker DNAT, including Swarm ingress
@@ -192,6 +233,7 @@ Before=docker.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$script
+ExecReload=$script
 
 [Install]
 RequiredBy=docker.service
@@ -201,7 +243,7 @@ UNIT
   write_file /etc/systemd/system/dokploy-ui-firewall.service 0644 "$unit" || true
   run systemctl daemon-reload
   run systemctl enable dokploy-ui-firewall.service || die "Could not enable Dokploy firewall persistence."
-  run systemctl restart dokploy-ui-firewall.service \
+  run systemctl reload-or-restart dokploy-ui-firewall.service \
     || die "Could not apply Dokploy UI protection. Check the host firewall before proceeding."
   if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
     ok "Dokploy UI public access configured"

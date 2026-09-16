@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # setup-module: verify
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: verify - Check sshd, the firewall and the login account
 #
 #  The last chance to notice a lockout while there is still a working shell to
-#  fix it from. Everything here is read-only: it proves the door opens rather
-#  than assuming the previous steps left it that way.
+#  fix it from. Everything here is read-only. These local checks do not prove
+#  that a real remote login, application deployment or reboot will succeed.
 #
 #  Sourced by setup.sh, never run on its own. Everything here executes inside
 #  the main script's shell: its options (OPT_*), helpers (step, run, run_spin,
@@ -23,16 +23,39 @@ fn_verify() {
     return 0
   fi
 
-  if run_sh "ss -ltnH 'sport = :${OPT_SSH_PORT}' | grep -q ."; then
-    ok "sshd is listening on port ${OPT_SSH_PORT}"
-  else
-    warn "Nothing is listening on port ${OPT_SSH_PORT}. Do not close this session; check 'systemctl status ssh'."
+  if is_enabled ssh; then
+    run sshd -t || die "Final SSH configuration validation failed. Keep this session open."
+    local port
+    for port in ${SSH_LISTEN_PORTS:-$OPT_SSH_PORT}; do
+      run_sh "ss -ltnH 'sport = :${port}' | grep -q ." \
+        || die "Nothing is listening on SSH port $port. Keep this session open and check 'systemctl status ssh'."
+    done
+    if [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then ssh_validate_key_policy; fi
+    ok "SSH listening ports and configuration verified"
   fi
 
   if have ufw && run_sh "ufw status | grep -qi '^Status: active'"; then
     detail "UFW active"
   else
+    [ "$FIREWALL_APPLIED" -eq 0 ] || die "UFW was configured but is no longer active."
     detail "UFW not active"
+  fi
+
+  if [ -n "$OPT_LOCKDOWN_INTERFACES" ] || [ -f /etc/systemd/system/server-init-ingress.service ]; then
+    run systemctl is-active --quiet server-init-ingress.service \
+      && run /usr/local/sbin/server-init-ingress --check \
+      || die "Persistent public ingress protection failed final verification."
+  fi
+  if [ "$DOCKER_REQUIRED" -eq 1 ]; then
+    run timeout 10 docker info || die "Docker is unavailable after provisioning."
+  fi
+  if [ "$FAIL2BAN_CONFIGURED" -eq 1 ]; then
+    run timeout 5 fail2ban-client status sshd || die "The fail2ban SSH jail is unavailable."
+  fi
+  if [ "$DOKPLOY_INSTALLED" -eq 1 ]; then
+    dokploy_services_ready || die "Dokploy services became unhealthy before setup completed."
+    run systemctl is-active --quiet dokploy-ui-firewall.service \
+      || die "Dokploy UI firewall is inactive."
   fi
 
   verify_authorized_keys
@@ -53,6 +76,7 @@ verify_authorized_keys() {
   f="$(ssh_authorized_keys_path)"
 
   if [ ! -s "$f" ]; then
+    [ "$OPT_SSH_KEY_ONLY" -eq 0 ] || die "Key-only SSH is enabled but '$OPT_USERNAME' has no authorized_keys."
     detail "No authorized_keys for '$OPT_USERNAME'; sshd falls back to whatever it was already configured to accept"
     return 0
   fi
@@ -61,8 +85,10 @@ verify_authorized_keys() {
   perm="$(stat -c '%a' "$f" 2>/dev/null || true)"
 
   if [ -n "$owner" ] && [ "$owner" != "$OPT_USERNAME" ]; then
+    [ "$OPT_SSH_KEY_ONLY" -eq 0 ] || die "Key-only SSH account has an unexpected authorized_keys owner: $owner."
     warn "$f is owned by '$owner', not '$OPT_USERNAME'; sshd will ignore it."
   elif [ -n "$perm" ] && [ "$perm" != "600" ] && [ "$perm" != "400" ]; then
+    [ "$OPT_SSH_KEY_ONLY" -eq 0 ] || die "Key-only SSH account has unexpected authorized_keys permissions: $perm."
     warn "$f is mode $perm; sshd may refuse to read it. Expected 600."
   else
     ok "$(ssh_count_keys) authorized key(s) in place for '$OPT_USERNAME'"

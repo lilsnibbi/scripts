@@ -25,6 +25,9 @@ bash tests/safety.sh
 bash tests/ui.sh
 sudo bash tests/local-ssh.sh
 sudo bash tests/dokploy-firewall.sh
+sudo bash tests/ingress.sh
+sudo bash tests/ssh-login.sh
+bash tests/dokploy-health.sh
 shellcheck -S warning -e SC2034,SC1090 lib/setup.sh lib/setup/*.sh tests/*.sh
 git diff --check
 ```
@@ -44,9 +47,18 @@ sourced test fixtures. Other warning-level diagnostics must pass.
   loopback and unrelated translated ports. Requires root, iproute2, iptables,
   curl, Python and namespaces. IPv6 tests explicitly skip when the kernel
   disables IPv6.
+- `ingress.sh`: public interface filtering, SSH allowlists, translated ports,
+  internal traffic, outbound replies, failed updates and rule drift; namespaces
+  and dependencies as above.
+- `ssh-login.sh`: actual root command execution with an RSA-4096 key and rejection
+  of a password-only client. Uses isolated account files with PAM disabled;
+  production PAM/account behaviour still requires a target login test.
+- `dokploy-health.sh`: command mocks reject missing services, failed replicas,
+  unavailable PostgreSQL, failed application health and missing/broken Traefik.
 
-Service operations are mocked. Tests do not require Docker or change host
-configuration. Also run full and selected-component `--dry-run` previews.
+Systemd service operations are mocked; `ssh-login.sh` starts its own isolated
+sshd. Tests do not require Docker or change host configuration. Also run full
+and selected-component `--dry-run` previews.
 
 ## Implementation boundaries
 
@@ -58,6 +70,22 @@ configuration. Also run full and selected-component `--dry-run` previews.
 - Explicit SSH changes snapshot configuration and restore it after validation
   or restart failure. Provider firewalls and actual remote login are outside
   these checks. Default runs retain ports and socket bind addresses.
+- `--ssh-key-only` disables password/keyboard-interactive SSH but allows root
+  public keys for Dokploy. It preserves PAM and the console password. Existing
+  conflicting policies fail validation; representative source checks cannot
+  exhaust every possible Match condition.
+- `--lockdown-interface` installs a separate mangle/PREROUTING guard before
+  component installations. It filters both host and forwarded traffic on the
+  named interfaces. Address-family transactions are separate; existing connections
+  and network control traffic remain allowed. Private interfaces are untouched.
+  The guard is required before Docker/SSH at boot. Reloading guards avoids
+  restarting dependent services. Renaming/removing an interface requires reviewing
+  the configuration; old interface hooks are retained conservatively on reruns.
+- Fresh Dokploy installs use release v0.30.6 and a SHA-256 checked release
+  installer. Packages and image tags remain mutable. A successful installer exit
+  must be followed by database/application/proxy readiness. The wrapper removes
+  group/other write permission from `/etc/dokploy`; it does not recursively alter
+  application-owned files. Partial installations require operator repair.
 - Dokploy protection runs before installation and before Docker at boot via
   a required systemd unit. Its mangle/PREROUTING rule matches host-local TCP
   3000 before destination translation. Loopback is exempt. Address-family
@@ -74,7 +102,7 @@ configuration. Also run full and selected-component `--dry-run` previews.
 
 ## Release validation
 
-Publish API 5 framework/modules together. Mixed versions must fail before
+Publish API 6 framework/modules together. Mixed versions must fail before
 component changes. Before fleet rollout, exercise fresh setup and reruns on
 disposable Debian/Ubuntu VMs, Proxmox CTs and representative existing hosts.
 Verify IPv4/IPv6 from another machine, reboot persistence, actual systemd

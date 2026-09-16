@@ -30,7 +30,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.6.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -47,7 +47,8 @@ SETUP_BASE="${SETUP_BASE:-}"
 # 3: hardware-gated local_access_enabled, shared by SSH, Dokploy and hardening.
 # 4: atomic fatal-on-error writes, preserved SSH ports and workload detection.
 # 5: structured progress and step_skip reporting shared by component modules.
-SETUP_API=5
+# 6: explicit public-interface ingress guard and required-service verification.
+SETUP_API=6
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -84,6 +85,7 @@ OPT_SSH_PORT="22"
 OPT_SSH_PORT_SET=0
 SSH_LISTEN_PORTS=""
 OPT_PUBKEY=""
+OPT_SSH_KEY_ONLY=0
 OPT_HOSTNAME=""
 # UTC by default rather than whatever the image happens to ship. Timestamps
 # from a fleet are only comparable if every host agrees on the zone, and a
@@ -94,6 +96,12 @@ OPT_UI_ALLOW=""
 OPT_UI_PUBLIC=0
 OPT_UI_LOCAL=0
 OPT_UI_TUNNEL=0
+OPT_LOCKDOWN_INTERFACES=""
+OPT_SSH_ALLOW=""
+SSH_GUARD_PORTS=""
+FIREWALL_APPLIED=0
+FAIL2BAN_CONFIGURED=0
+DOCKER_REQUIRED=0
 LOCAL_ACCESS_ENABLED=0
 OPT_AUTO_REBOOT=""
 OPT_EXCLUDE=""
@@ -842,10 +850,13 @@ usage() {
   ui "   --dry-run        Preview without applying changes."
   ui "   --username=NAME  Login account (default: root)."
   ui "   --pubkey=KEY     Append an SSH public key."
+  ui "   --ssh-key-only   Require SSH keys; retain root key access for Dokploy."
   ui "   --ssh-port=N     Change SSH port (default: preserve existing ports)."
   ui "   --ui=ACCESS      Dokploy access: tunnel (default), CIDR[,CIDR], public, local."
   ui "                    local also permits LAN SSH passwords on desktops/laptops;"
   ui "                    ignored on servers/VMs/CTs. public exposes first-admin setup."
+  ui "   --lockdown-interface=IFACE[,IFACE]  Block public ingress before Docker NAT."
+  ui "   --ssh-allow=CIDR[,CIDR]|none        IPv4 SSH sources for lockdown mode."
   ui "   --help           Show this help."
   ui "   --version        Show version."
   ui ""
@@ -896,6 +907,7 @@ parse_args() {
       --username=*)          OPT_USERNAME="$value" ;;
       --ssh-port=*)          OPT_SSH_PORT="$value"; OPT_SSH_PORT_SET=1 ;;
       --pubkey=*)            OPT_PUBKEY="$value" ;;
+      --ssh-key-only)        OPT_SSH_KEY_ONLY=1 ;;
       --hostname=*)          OPT_HOSTNAME="$value" ;;
       --timezone=*)          OPT_TIMEZONE="$value"; OPT_TIMEZONE_SET=1 ;;
       --ui=*)
@@ -909,6 +921,8 @@ parse_args() {
         esac
         ;;
       --ui-allow=*)          OPT_UI_ALLOW="$value" ;;
+      --lockdown-interface=*) OPT_LOCKDOWN_INTERFACES="$value" ;;
+      --ssh-allow=*)         OPT_SSH_ALLOW="$value" ;;
       --ui-public)           OPT_UI_PUBLIC=1 ;;
       --local)               OPT_UI_LOCAL=1 ;;
       --auto-reboot=*)       OPT_AUTO_REBOOT="$value" ;;
@@ -955,6 +969,11 @@ validate_args() {
 
   if [ -n "$OPT_EXCLUDE" ] && [ -n "$OPT_ONLY" ]; then
     die "--skip/--exclude and --only cannot be combined"
+  fi
+  if [ "$OPT_SSH_KEY_ONLY" -eq 1 ]; then
+    is_enabled ssh || die "--ssh-key-only requires the ssh component."
+    [ -n "$OPT_PUBKEY" ] || die "--ssh-key-only requires --pubkey."
+    [ "$OPT_UI_LOCAL" -eq 0 ] || die "--ssh-key-only cannot enable local password access."
   fi
 
   # Reject unknown component names in --skip / legacy selection options.
@@ -1013,6 +1032,47 @@ validate_args() {
   if [ -n "$OPT_AUTO_REBOOT" ] && ! [[ "$OPT_AUTO_REBOOT" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
     die "--auto-reboot must be a 24-hour time such as 03:30 (got: $OPT_AUTO_REBOOT)"
   fi
+
+  if [ -n "$OPT_LOCKDOWN_INTERFACES" ]; then
+    [[ "$OPT_LOCKDOWN_INTERFACES" =~ ^[a-zA-Z0-9_.:-]+(,[a-zA-Z0-9_.:-]+)*$ ]] \
+      || die "--lockdown-interface must name the public network interface(s)."
+    local iface
+    for iface in ${OPT_LOCKDOWN_INTERFACES//,/ }; do
+      [ "$iface" != lo ] && [ "${#iface}" -le 15 ] \
+        || die "Invalid lockdown interface: $iface"
+    done
+    is_enabled firewall || die "Lockdown requires the firewall component."
+    is_enabled verify || die "Lockdown requires the verify component."
+    [ "$OPT_UI_PUBLIC" -eq 0 ] && [ "$OPT_UI_LOCAL" -eq 0 ] && [ -z "$OPT_UI_ALLOW" ] \
+      || die "Lockdown requires tunnel-only Dokploy UI access."
+    [ -n "$OPT_SSH_ALLOW" ] || die "Lockdown requires --ssh-allow=IPv4/CIDR or --ssh-allow=none."
+    if [ "$OPT_SSH_ALLOW" != none ]; then
+      validate_ipv4_list "$OPT_SSH_ALLOW" "--ssh-allow"
+      case ",$OPT_SSH_ALLOW," in *,0.0.0.0/0,*) die "Lockdown SSH cannot allow the entire internet." ;; esac
+    fi
+  elif [ -n "$OPT_SSH_ALLOW" ]; then
+    die "--ssh-allow requires --lockdown-interface."
+  fi
+}
+
+validate_ipv4_list() {
+  local list="$1" label="$2" cidr
+  [[ "$list" =~ ^[0-9./]+(,[0-9./]+)*$ ]] || die "$label requires IPv4 addresses/CIDRs."
+  for cidr in ${list//,/ }; do
+    [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]] \
+      && is_ipv4 "${cidr%/*}" || die "Invalid $label entry: $cidr"
+    [ "${cidr##*/}" != 0 ] || die "$label cannot allow the entire internet."
+  done
+}
+
+ipv4_in_cidr() {
+  local address="$1" cidr="$2" prefix=32 value=0 network=0 octet
+  is_ipv4 "$address" || return 1
+  [[ "$cidr" != */* ]] || prefix="${cidr##*/}"
+  for octet in ${address//./ }; do value=$(( (value << 8) | 10#$octet )); done
+  local base="${cidr%/*}"
+  for octet in ${base//./ }; do network=$(( (network << 8) | 10#$octet )); done
+  [ $((value >> (32 - prefix))) -eq $((network >> (32 - prefix))) ]
 }
 
 # The private ranges --local stands for: RFC1918, and nothing else. Tailscale
@@ -1279,6 +1339,38 @@ bootstrap_packages() {
   ok "Prerequisites installed: ${missing[*]}"
 }
 
+# sshd_config's Port can differ from the actual port owned by ssh.socket.
+# Include the effective socket and this session so skipping the SSH component
+# cannot silently close an already working custom-port login.
+discover_ssh_ports() {
+  local configured="" socket_ports="" current_port="" active_ports="" ignored
+  if have sshd; then
+    configured="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true)"
+  fi
+  if have systemctl; then
+    socket_ports="$(systemctl show ssh.socket -p Listen --value 2>/dev/null | awk '
+      { for (i = 2; i <= NF; i++) if ($i == "(Stream)") {
+          endpoint = $(i - 1); sub(/^.*:/, "", endpoint)
+          if (endpoint ~ /^[0-9]+$/) print endpoint
+      }}' || true)"
+  fi
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    read -r ignored ignored ignored current_port <<<"$SSH_CONNECTION"
+    [[ "$current_port" =~ ^[0-9]+$ ]] || current_port=""
+  fi
+  SSH_GUARD_PORTS="$(printf '%s\n%s\n%s\n%s\n' "$configured" "$socket_ports" "$current_port" "$OPT_SSH_PORT" \
+    | sed '/^$/d' | sort -nu)"
+  if [ "$OPT_SSH_PORT_SET" -eq 0 ]; then
+    active_ports="$configured"
+    if [ -n "$socket_ports" ] && systemctl is-enabled ssh.socket >/dev/null 2>&1; then
+      active_ports="$socket_ports"
+    fi
+    SSH_LISTEN_PORTS="${active_ports:-$current_port}"
+    [ -n "$SSH_LISTEN_PORTS" ] || SSH_LISTEN_PORTS="$OPT_SSH_PORT"
+    OPT_SSH_PORT="${SSH_LISTEN_PORTS%%$'\n'*}"
+  fi
+}
+
 preflight() {
   CURRENT_STEP="preflight"
 
@@ -1291,14 +1383,8 @@ preflight() {
 
   # Load and validate every module before clock/package/configuration changes.
   load_modules "${TO_RUN[@]}"
-  if [ "$OPT_SSH_PORT_SET" -eq 0 ] && have sshd; then
-    local ports
-    ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true)"
-    if [ -n "$ports" ]; then
-      SSH_LISTEN_PORTS="$ports"
-      OPT_SSH_PORT="${ports%%$'\n'*}"
-    fi
-  fi
+  discover_ssh_ports
+  if [ -n "$OPT_LOCKDOWN_INTERFACES" ]; then lockdown_preflight; fi
 
   case "$ARCH" in
     amd64|arm64|x86_64|aarch64) ;;
@@ -1327,6 +1413,8 @@ preflight() {
 
   # Prerequisites precede every component, including partial runs.
   bootstrap_packages
+  # Protect public interfaces before base packages or installers can start daemons.
+  if [ -n "$OPT_LOCKDOWN_INTERFACES" ]; then configure_ingress_guard; fi
 }
 
 # Classification is for display only. Security gates continue to use their

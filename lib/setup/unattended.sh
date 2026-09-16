@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: unattended
-# setup-api: 5
+# setup-api: 6
 # =============================================================================
 #  Component: unattended - Enable automatic security updates
 #
@@ -23,8 +23,7 @@ fn_unattended() {
 
   apt_ensure_lists || true
   apt_install "unattended-upgrades" unattended-upgrades apt-listchanges || {
-    warn "Could not install unattended-upgrades; skipping."
-    return 0
+    die "Could not install the selected unattended-upgrades component."
   }
 
   local origins
@@ -129,11 +128,12 @@ CONF
     if unattended-upgrade --dry-run --debug >&4 2>&1; then
       detail "Configuration validated with a dry run"
     else
-      warn "'unattended-upgrades --dry-run' reported a problem; see: ${LOG_HINT}"
+      die "'unattended-upgrades --dry-run' reported a problem; see: ${LOG_HINT}"
     fi
   fi
 
-  run systemctl enable --now unattended-upgrades.service || true
+  run systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer \
+    || die "Could not enable automatic security updates and their timers."
   if [ -n "$OPT_AUTO_REBOOT" ]; then
     ok "Security updates applied automatically; reboots at ${OPT_AUTO_REBOOT} when needed"
   else

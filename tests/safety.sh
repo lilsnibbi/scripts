@@ -63,7 +63,7 @@ for entry in "${COMPONENTS[@]}"; do
 done
 assert grep -q -- '--skip=docker,ssh,fail2ban' "$test_dir/list"
 bash "$repo/lib/setup.sh" --help >"$test_dir/help"
-assert test "$(grep -c '^   --' "$test_dir/help")" = 9
+assert test "$(grep -c '^   --' "$test_dir/help")" = 12
 echo 'PASS: compact help, complete component list, combined skips, UI modes and conflict rejection'
 
 (
@@ -92,6 +92,67 @@ OPT_PUBKEY=$'ssh-ed25519 AAAA\nssh-rsa BBBB'
 reject validate_args
 OPT_PUBKEY=''
 echo 'PASS: input rejection and port normalisation'
+
+reject bash "$repo/lib/setup.sh" --dry-run --lockdown-interface=eth0
+reject bash "$repo/lib/setup.sh" --dry-run --ssh-allow=192.0.2.1
+reject bash "$repo/lib/setup.sh" --dry-run --lockdown-interface=lo --ssh-allow=none
+for value in 0.0.0.0/0 192.0.2.1/0 256.1.1.1 1.2.3.4/33 ::1 '192.0.2.1;bad'; do
+  reject bash "$repo/lib/setup.sh" --dry-run --lockdown-interface=eth0 --ssh-allow="$value"
+done
+for value in firewall verify; do
+  reject bash "$repo/lib/setup.sh" --dry-run --lockdown-interface=eth0 --ssh-allow=none --skip="$value"
+done
+reject bash "$repo/lib/setup.sh" --dry-run --lockdown-interface=eth0 --ssh-allow=none --ui=public
+reject bash "$repo/lib/setup.sh" --dry-run --ssh-key-only
+reject bash "$repo/lib/setup.sh" --dry-run --ssh-key-only --username=deploy
+reject bash "$repo/lib/setup.sh" --dry-run --ssh-key-only --username=deploy --pubkey='ssh-ed25519 AAAA' --local
+assert ipv4_in_cidr 192.0.2.23 192.0.2.0/24
+assert ipv4_in_cidr 192.0.2.23 192.0.2.23
+reject ipv4_in_cidr 192.0.3.1 192.0.2.0/24
+reject ipv4_in_cidr 2001:db8::1 192.0.2.0/24
+echo 'PASS: explicit ingress/key-only input validation and SSH source membership'
+
+(
+  have() { return 0; }
+  sshd() { printf 'port 22\n'; }
+  systemctl() {
+    case "$1" in
+      show) printf '0.0.0.0:2222 (Stream)\n' ;;
+      is-enabled) return 0 ;;
+    esac
+  }
+  SSH_CONNECTION='192.0.2.2 40000 198.51.100.1 2200'
+  OPT_SSH_PORT=22 OPT_SSH_PORT_SET=0
+  discover_ssh_ports
+  assert test "$SSH_LISTEN_PORTS" = 2222
+  assert test "$OPT_SSH_PORT" = 2222
+  for port in 22 2200 2222; do
+    assert grep -qx "$port" <<<"$SSH_GUARD_PORTS"
+  done
+)
+echo 'PASS: existing socket and current-session SSH ports retained without configuring SSH'
+
+(
+  source "$repo/lib/setup/firewall.sh"
+  step() { :; }
+  has_container_workloads() { return 1; }
+  have() { return 0; }
+  ss() { printf 'udp UNCONN 0 0 0.0.0.0:68 0.0.0.0:*\nudp UNCONN 0 0 [::]:546 [::]:*\nudp UNCONN 0 0 0.0.0.0:123 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'; }
+  ufw() { echo 'Status: inactive'; }
+  run() { printf '%s\n' "$*" >>"$test_dir/firewall-commands"; }
+  run_sh() { run "$@"; }
+  OPT_SSH_PORT=22 OPT_LOCKDOWN_INTERFACES=eth0 OPT_SSH_ALLOW=192.0.2.1/32
+  fn_firewall
+  assert test "$FIREWALL_APPLIED" = 1
+  assert grep -q 'ufw allow from 192.0.2.1/32 to any port 22' "$test_dir/firewall-commands"
+  assert grep -q 'ufw allow in on docker_gwbridge to any port 22' "$test_dir/firewall-commands"
+  if grep -qE 'allow (22|80|443)/' "$test_dir/firewall-commands"; then exit 1; fi
+  FIREWALL_APPLIED=0
+  ss() { printf 'tcp LISTEN 0 128 0.0.0.0:8006 0.0.0.0:*\n'; }
+  fn_firewall
+  assert test "$FIREWALL_APPLIED" = 0
+)
+echo 'PASS: DHCP/NTP do not skip fresh-host firewall; unrelated services still preserve policy'
 
 OPT_DRY_RUN=0
 write_file "$test_dir/config" 0600 original
@@ -195,7 +256,7 @@ unset -f have
 have() { command -v "$1" >/dev/null 2>&1; }
 for file in "$repo/lib/setup.sh" "$repo"/lib/setup/*.sh "$repo"/tests/*.sh; do bash -n "$file"; done
 for file in "$repo"/lib/setup/*.sh; do verify_module "$(basename "$file" .sh)" "$file"; done
-sed 's/# setup-api: 5/# setup-api: 4/' "$repo/lib/setup/docker.sh" >"$test_dir/stale"
+sed 's/# setup-api: 6/# setup-api: 5/' "$repo/lib/setup/docker.sh" >"$test_dir/stale"
 reject verify_module docker "$test_dir/stale"
 head -n -2 "$repo/lib/setup/docker.sh" >"$test_dir/truncated"
 reject verify_module docker "$test_dir/truncated"
