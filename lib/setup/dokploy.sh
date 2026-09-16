@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: dokploy
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: dokploy - Install the Dokploy PaaS platform
 #
@@ -13,13 +13,16 @@
 
 dokploy_is_installed() {
   have docker || return 1
-  docker info 2>/dev/null | grep -q 'Swarm: active' || return 1
-  [ -n "$(docker service ls --filter name=dokploy --quiet 2>/dev/null)" ]
+  [ "$(docker service inspect --format '{{.Spec.Name}}' dokploy 2>/dev/null)" = dokploy ]
 }
 
 # Dokploy's installer aborts if anything holds 80, 443 or 3000. Reporting which
 # process holds the port is far more useful than its bare error message.
 dokploy_check_ports() {
+  if ! have ss; then
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then return 0; fi
+    die "Cannot check Dokploy ports: ss (iproute2) is unavailable."
+  fi
   local port busy=0
   for port in 80 443 3000; do
     if ss -tulnp 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
@@ -48,16 +51,30 @@ fn_dokploy() {
     if [ "$OPT_REINSTALL_DOKPLOY" -eq 0 ]; then
       ok "Dokploy is already installed; leaving it untouched"
       detail "Re-running the installer would leave and re-initialise Docker Swarm"
-      detail "Use --reinstall-dokploy to force it, or 'dokploy update' to upgrade"
+      detail "Use Dokploy's documented update procedure to upgrade"
       DOKPLOY_INSTALLED=1
       restrict_dokploy_ui
       return 0
     fi
     warn "Reinstalling Dokploy: Docker Swarm will be left and re-initialised."
+    restrict_dokploy_ui
     detail "Removing the existing Dokploy services so the ports are free"
     run docker service rm dokploy dokploy-postgres || true
     run docker rm -f dokploy-traefik || true
     sleep 5
+  elif has_container_workloads; then
+    warn "Existing container/Swarm host detected; skipping Dokploy to preserve its workloads."
+    return 0
+  fi
+
+  if [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
+    warn "Dokploy cannot be installed inside a Docker/Podman container; skipping."
+    return 0
+  fi
+
+  if ! have ss; then
+    apt_ensure_lists || die "Could not refresh port-check dependency indexes."
+    apt_install "port checks" iproute2 || die "Could not install iproute2."
   fi
 
   if ! dokploy_check_ports; then
@@ -75,14 +92,17 @@ fn_dokploy() {
   local installer
   installer="$(mktemp)"
   run_spin "Downloading the Dokploy installer" \
-    retry curl -fsSL --connect-timeout 20 https://dokploy.com/install.sh -o "$installer" \
+    retry curl -fsSL --connect-timeout 20 --max-time 120 https://dokploy.com/install.sh -o "$installer" \
     || { rm -f "$installer"; die "Could not download the Dokploy installer."; }
 
   # Sanity check: a captive portal or error page must not be piped into a shell.
-  if ! head -n1 "$installer" | grep -q '^#!'; then
+  if ! head -n1 "$installer" | grep -q '^#!' || ! bash -n "$installer"; then
     rm -f "$installer"
     die "The downloaded Dokploy installer is not a shell script. Aborting rather than executing it."
   fi
+
+  # Install access controls before the first-run administrator UI can bind.
+  restrict_dokploy_ui
 
   info "Running the Dokploy installer (pulls several images; expect 2-5 minutes)"
   if run_spin "Installing Dokploy" bash "$installer"; then
@@ -114,57 +134,59 @@ wait_for_dokploy() {
   return 0
 }
 
-# Restrict the Dokploy UI to specific sources.
-#
-# UFW cannot do this: Docker's iptables rules run first. The rule has to live in
-# the DOCKER-USER chain, and is re-applied at boot by a systemd unit because
-# iptables rules do not persist.
-# Port 3000 is closed to the internet unless somebody asks for it.
-#
-# The first visitor to reach an unclaimed Dokploy UI becomes its administrator,
-# which makes "reachable by default" the wrong default at any scale: the window
-# between this script finishing and a human logging in is exactly the window an
-# internet-wide scanner needs. Loopback is unaffected either way - a published
-# port reached over 127.0.0.1 never traverses the FORWARD chain - so an SSH
-# tunnel still works with no rules at all.
+# Filter local-destination traffic before Docker DNAT, including Swarm ingress
+# and IPv6 userland-proxy traffic. The loopback interface is explicitly exempt.
 restrict_dokploy_ui() {
-  if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
-    warn "The Dokploy UI on port 3000 is reachable from the whole internet (--ui-public)."
-    detail "Whoever opens it first creates the admin account. Do it now."
-    return 0
-  fi
-
-  local script=/usr/local/sbin/dokploy-ui-firewall
-  local cidrs
+  local script=/usr/local/sbin/dokploy-ui-firewall cidrs body unit
   cidrs="$(ui_allow_list)"
-  local body
-  body="$(cat <<SCRIPT
-#!/usr/bin/env bash
-# Managed by setup.sh. Restricts the Dokploy UI (port 3000) to allowed sources.
-# Docker bypasses UFW, so the rule must sit in the DOCKER-USER chain.
-set -euo pipefail
-
-ALLOW="$cidrs"
-
-iptables -N DOKPLOY-UI 2>/dev/null || iptables -F DOKPLOY-UI
-for cidr in \${ALLOW//,/ }; do
-  iptables -A DOKPLOY-UI -s "\$cidr" -j RETURN
+  if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
+    warn "Dokploy UI is public; claim the administrator account immediately."
+  fi
+  if ! have iptables || ! have ip6tables || ! have iptables-restore || ! have ip6tables-restore; then
+    apt_ensure_lists || die "Could not refresh firewall dependency indexes."
+    apt_install "Dokploy firewall" iptables || die "Could not install Dokploy firewall tools."
+  fi
+  body="$(printf '#!/usr/bin/env bash\nset -euo pipefail\nALLOW=%q\nPUBLIC=%q\n' "$cidrs" "$OPT_UI_PUBLIC")
+$(cat <<'SCRIPT'
+# Managed by setup.sh. Only traffic to this host's TCP port 3000 is filtered.
+apply_family() {
+  local tool="$1" restore="$2" family="$3" cidr
+  # iptables-restore commits a complete chain in one transaction; a failed
+  # update retains the previous rules instead of flushing a live allowlist.
+  {
+    printf '*mangle\n:DOKPLOY-UI - [0:0]\n-F DOKPLOY-UI\n'
+    printf -- '-A DOKPLOY-UI -i lo -j RETURN\n'
+    if [ "$PUBLIC" -eq 0 ]; then
+      if [ "$family" = 4 ]; then
+        for cidr in ${ALLOW//,/ }; do
+          printf -- '-A DOKPLOY-UI -s %s -j RETURN\n' "$cidr"
+        done
+      fi
+      printf -- '-A DOKPLOY-UI -j DROP\n'
+    else
+      printf -- '-A DOKPLOY-UI -j RETURN\n'
+    fi
+    printf 'COMMIT\n'
+  } | "$restore" --wait 10 --noflush
+  "$tool" -w 10 -t mangle -C PREROUTING -p tcp --dport 3000 -m addrtype --dst-type LOCAL -j DOKPLOY-UI 2>/dev/null \
+    || "$tool" -w 10 -t mangle -I PREROUTING 1 -p tcp --dport 3000 -m addrtype --dst-type LOCAL -j DOKPLOY-UI
+}
+apply_family iptables iptables-restore 4
+# A missing IPv6 firewall is fatal when IPv6 is enabled; never silently expose it.
+if [ -s /proc/net/if_inet6 ] || [ -d /proc/sys/net/ipv6 ]; then
+  apply_family ip6tables ip6tables-restore 6
+fi
+# Retire the old, post-DNAT IPv4 rule only after the replacement is active.
+while iptables -w 10 -C DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI 2>/dev/null; do
+  iptables -w 10 -D DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI
 done
-iptables -A DOKPLOY-UI -j DROP
-
-iptables -C DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI 2>/dev/null \\
-  || iptables -I DOCKER-USER -p tcp --dport 3000 -j DOKPLOY-UI
 SCRIPT
 )"
-
   write_file "$script" 0755 "$body" || true
-
-  local unit
   unit="$(cat <<UNIT
 [Unit]
-Description=Restrict the Dokploy UI port to allowed sources
-After=docker.service
-Requires=docker.service
+Description=Restrict Dokploy UI before Docker starts
+Before=docker.service
 
 [Service]
 Type=oneshot
@@ -172,24 +194,21 @@ RemainAfterExit=yes
 ExecStart=$script
 
 [Install]
+RequiredBy=docker.service
 WantedBy=multi-user.target
 UNIT
 )"
   write_file /etc/systemd/system/dokploy-ui-firewall.service 0644 "$unit" || true
-
   run systemctl daemon-reload
-  run systemctl enable dokploy-ui-firewall.service || true
-  if run systemctl restart dokploy-ui-firewall.service; then
-    if [ -n "$cidrs" ]; then
-      ok "Dokploy UI on port 3000 restricted to: $cidrs"
-    else
-      ok "Dokploy UI on port 3000 closed to the network"
-      detail "Reach it over an SSH tunnel, the Cloudflare tunnel, or reopen it with:"
-      detail "  sudo ./setup.sh --only=dokploy --local            (your LAN)"
-      detail "  sudo ./setup.sh --only=dokploy --ui-allow=<ip>/32 (one address)"
-    fi
+  run systemctl enable dokploy-ui-firewall.service || die "Could not enable Dokploy firewall persistence."
+  run systemctl restart dokploy-ui-firewall.service \
+    || die "Could not apply Dokploy UI protection. Check the host firewall before proceeding."
+  if [ "$OPT_UI_PUBLIC" -eq 1 ]; then
+    ok "Dokploy UI public access configured"
+  elif [ -n "$cidrs" ]; then
+    ok "Dokploy UI restricted to: $cidrs (IPv6 blocked)"
   else
-    warn "Could not apply the port 3000 restriction; the UI may be publicly reachable."
+    ok "Dokploy UI closed to the network; use an SSH tunnel"
   fi
 }
 

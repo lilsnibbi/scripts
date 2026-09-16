@@ -2,8 +2,8 @@
 #  Test harness for setup.sh
 #
 #  A full Ubuntu 24.04 image running systemd as PID 1, so the parts of setup.sh
-#  that need a real init system -- sshd, ufw, fail2ban, dockerd, Dokploy's swarm
-#  services -- behave the way they do on a real VM instead of being stubbed out.
+#  that need a real init system can be exercised. This is not a VM: Dokploy's
+#  installer rejects Docker containers, and host-owned settings are skipped.
 #
 #  Build:
 #    docker build -t init-scripts-test .
@@ -19,7 +19,7 @@
 #  Exec in and run the script by hand:
 #    docker exec -it init-test bash
 #    cd /opt/init-scripts && lib/setup.sh --dry-run
-#    lib/setup.sh --username=deploy --ssh-port=2222 --ui-allow=10.0.0.0/8
+#    lib/setup.sh --exclude=dokploy
 #
 #  Reset to a clean machine between attempts:
 #    docker rm -f init-test && docker run -d ... (as above)

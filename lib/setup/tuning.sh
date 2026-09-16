@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: tuning
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: tuning - Performance tuning: network stack, limits, power, CPU
 #  governor
@@ -33,7 +33,7 @@ tune_sysctl() {
   # the config once the kernel actually offers it: a sysctl the kernel cannot
   # satisfy would make every future 'sysctl --system' report an error.
   local bbr=""
-  run modprobe tcp_bbr || true
+  if ! in_container; then run modprobe tcp_bbr || true; fi
   if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
     bbr="
 
@@ -55,9 +55,6 @@ net.ipv4.tcp_congestion_control = bbr"
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
 
-# More ephemeral ports for proxy-heavy workloads.
-net.ipv4.ip_local_port_range = 10240 65535
-
 # Containerised apps and file watchers exhaust the inotify defaults constantly.
 fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 512
@@ -67,8 +64,12 @@ vm.max_map_count = 262144${bbr}
 CONF
 )"
 
+  if in_container; then
+    conf="$(printf '%s\n' "$conf" | sed '/^fs\./d; /^vm\./d')"
+  fi
+
   if write_file /etc/sysctl.d/98-server-init-tuning.conf 0644 "$conf"; then
-    if run sysctl --system; then
+    if run sysctl -p /etc/sysctl.d/98-server-init-tuning.conf; then
       ok "Network and limit tuning applied"
     elif in_container; then
       detail "Tuning applied where the container is allowed to; the rest is the host's"

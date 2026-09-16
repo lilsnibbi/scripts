@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: docker
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: docker - Install Docker CE with container log rotation
 #
@@ -18,7 +18,21 @@
 fn_docker() {
   step "Docker"
 
-  # Legacy packages conflict with docker-ce and must go first.
+  # Never replace a working runtime (including distro Docker or Podman), or
+  # rewrite/restart a daemon serving existing containers.
+  if have docker; then
+    if docker version >/dev/null 2>&1; then
+      ok "Existing Docker-compatible runtime preserved"
+      return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+      warn "Existing Docker daemon is unavailable; a modifying run would stop here."
+      return 0
+    fi
+    die "Docker is installed but unavailable. Restore the existing daemon before retrying; its packages and configuration were preserved."
+  fi
+
+  # Do not remove another workload's runtime to make room for Docker CE.
   local legacy=(docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc)
   local installed=()
   local p
@@ -28,8 +42,7 @@ fn_docker() {
     fi
   done
   if [ ${#installed[@]} -gt 0 ]; then
-    detail "Removing conflicting packages: ${installed[*]}"
-    run apt-get remove "${APT_OPTS[@]}" "${installed[@]}" || true
+    die "Existing container runtime packages (${installed[*]}) were preserved. Resolve the runtime installation before installing Docker CE."
   fi
 
   if have docker && docker version >/dev/null 2>&1; then
@@ -43,7 +56,7 @@ fn_docker() {
 
     run install -m 0755 -d /etc/apt/keyrings
     run_spin "Fetching the Docker signing key" \
-      retry curl -fsSL --connect-timeout 15 "https://download.docker.com/linux/${repo_os}/gpg" \
+      retry curl -fsSL --connect-timeout 15 --max-time 120 "https://download.docker.com/linux/${repo_os}/gpg" \
       -o /etc/apt/keyrings/docker.asc \
       || die "Could not download the Docker GPG key."
     run chmod a+r /etc/apt/keyrings/docker.asc
@@ -54,14 +67,12 @@ fn_docker() {
     run rm -f /etc/apt/sources.list.d/docker.sources
 
     apt_update || die "apt-get update failed after adding the Docker repository."
+    # Package installation starts dockerd, so write defaults before that start.
+    configure_docker_daemon
     apt_install "Docker Engine" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
       || die "Docker installation failed. See: ${LOG_HINT}"
     ok "Docker installed: $(docker --version 2>/dev/null || echo unknown)"
   fi
-
-  # Unbounded container logs are a classic way for an unattended server to fill
-  # its disk months later.
-  configure_docker_daemon
 
   run systemctl enable docker || true
   run systemctl start docker \
@@ -80,8 +91,7 @@ configure_docker_daemon() {
   "log-opts": {
     "max-size": "20m",
     "max-file": "5"
-  },
-  "live-restore": false
+  }
 }'
 
   if [ ! -f "$f" ]; then
@@ -89,21 +99,7 @@ configure_docker_daemon() {
     return 0
   fi
 
-  # An existing daemon.json is merged rather than replaced, so Dokploy's or the
-  # operator's own settings survive a re-run.
-  if have jq && [ "$OPT_DRY_RUN" -eq 0 ]; then
-    local merged
-    if merged="$(jq -s '.[0] * .[1]' "$f" <(printf '%s' "$desired") 2>/dev/null)" && [ -n "$merged" ]; then
-      if [ "$merged" != "$(cat "$f")" ]; then
-        backup_file "$f"
-        printf '%s\n' "$merged" >"$f"
-        run systemctl restart docker || warn "Docker did not restart cleanly after the daemon.json update."
-        detail "Merged log rotation settings into the existing daemon.json"
-      fi
-      return 0
-    fi
-  fi
-  warn "Left the existing /etc/docker/daemon.json untouched; container log rotation not applied."
+  detail "Existing Docker daemon configuration preserved"
 }
 
 # end-of-module

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: bun
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: bun - Install the Bun JavaScript runtime
 #
@@ -33,8 +33,8 @@ fn_bun() {
   local installer
   installer="$(mktemp)"
   if ! run_spin "Downloading the Bun installer" \
-        retry curl -fsSL --connect-timeout 20 https://bun.sh/install -o "$installer" \
-     || ! head -n1 "$installer" | grep -q '^#!'; then
+        retry curl -fsSL --connect-timeout 20 --max-time 120 https://bun.sh/install -o "$installer" \
+     || ! head -n1 "$installer" | grep -q '^#!' || ! bash -n "$installer"; then
     rm -f "$installer"
     warn "Could not download the Bun installer; continuing without Bun."
     return 0

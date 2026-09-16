@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: fail2ban
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: fail2ban - Install and pre-configure fail2ban for SSH
 #
@@ -20,7 +20,11 @@ fn_fail2ban() {
   apt_ensure_lists || true
   apt_install "fail2ban" fail2ban python3-systemd || die "Could not install fail2ban."
 
-  local jail=/etc/fail2ban/jail.local
+  if [ -f /etc/fail2ban/jail.local ] && ! grep -q '^# Managed by setup.sh (Server Initialization Suite).' /etc/fail2ban/jail.local; then
+    detail "Existing fail2ban policy preserved"
+    return 0
+  fi
+  local jail=/etc/fail2ban/jail.d/90-server-init.local
   local content
   content="$(cat <<CONF
 # Managed by setup.sh (Server Initialization Suite).
@@ -55,6 +59,9 @@ CONF
 )"
 
   write_file "$jail" 0644 "$content" || true
+  if [ -f /etc/fail2ban/jail.local ] && grep -q '^# Managed by setup.sh (Server Initialization Suite).' /etc/fail2ban/jail.local; then
+    run rm -f /etc/fail2ban/jail.local
+  fi
 
   # The recidive jail reads fail2ban's own log file, so it must exist.
   run touch /var/log/fail2ban.log

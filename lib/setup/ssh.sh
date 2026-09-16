@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: ssh
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: ssh - Create the login account and set the SSH port
 #
@@ -60,6 +60,8 @@ ssh_install_pubkey() {
   local dir="$SSH_USER_HOME/.ssh"
   local file="$dir/authorized_keys"
 
+  [ ! -L "$dir" ] && [ ! -L "$file" ] || die "Refusing to change symlinked SSH key paths."
+
   if [ "$OPT_DRY_RUN" -eq 1 ]; then
     detail "Would install public key into $file"
     return 0
@@ -73,6 +75,8 @@ ssh_install_pubkey() {
   if grep -qxF "$pubkey" "$file" 2>/dev/null; then
     detail "Public key already present in authorized_keys"
   else
+    # Preserve the last existing key when its line has no terminating newline.
+    if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then printf '\n' >>"$file"; fi
     printf '%s\n' "$pubkey" >>"$file"
   fi
 }
@@ -102,10 +106,8 @@ ssh_setup_keys() {
   return 0
 }
 
-# Port is the only directive this script owns, and it is the only one commented
-# out elsewhere. sshd keeps the first value it finds, so a cloud image shipping
-# /etc/ssh/sshd_config.d/50-cloud-init.conf with its own Port would otherwise
-# silently win. Every other directive in those files is left exactly as it is.
+# Port directives accumulate. Replace them only when the caller explicitly
+# asks for a different port; all authentication directives remain untouched.
 ssh_neutralise_conflicts() {
   local ours="$1"
   local directives='Port'
@@ -214,8 +216,12 @@ ssh_local_config() {
 ssh_configure() (
   local ours=/etc/ssh/sshd_config.d/00-server-init.conf
   local main=/etc/ssh/sshd_config
-  local snapshot="" committed=0 restarting=0 f i content err
+  local snapshot="" committed=0 restarting=0 f i content err rc=0 restore_failed=0
   local -a paths=()
+  if [ "$OPT_SSH_PORT_SET" -eq 0 ]; then
+    # Leave all existing ports and socket addresses intact on normal reruns.
+    detail "Preserving existing SSH listening configuration"
+  fi
   if [ "$OPT_DRY_RUN" -eq 0 ]; then
     mkdir -p /run/sshd
     if ! err="$(sshd -t 2>&1)"; then
@@ -267,15 +273,16 @@ ssh_configure() (
     trap 'exit 143' TERM
   fi
 
-  ssh_ensure_include
-  ssh_neutralise_conflicts "$ours"
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then
+    ssh_ensure_include
+    ssh_neutralise_conflicts "$ours"
+  fi
 
   # Global port settings must stay outside the conditional LAN policy.
   content="$(cat <<CONF
 # Managed by setup.sh (Server Initialization Suite) — do not edit by hand.
 #
-# This file sorts first inside sshd_config.d on purpose: sshd keeps the first
-# value it sees for a directive, so nothing later can move the port back.
+# Other Port directives were disabled to avoid accumulating old listeners.
 #
 # Port is the only setting in this drop-in. An eligible --local exception is
 # managed separately at the end of the main config's global section.
@@ -286,7 +293,7 @@ CONF
 
   # No backup here: this file is fully managed and regenerated from scratch, so
   # a .bak of it carries no information. Backups are for files the system owns.
-  ssh_write_file "$ours" 0644 "$content"
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then ssh_write_file "$ours" 0644 "$content"; fi
 
   if [ "$OPT_DRY_RUN" -eq 0 ]; then
     content="$(ssh_local_config "$LOCAL_ACCESS_ENABLED" "$OPT_USERNAME" <"$main")" \
@@ -305,7 +312,31 @@ CONF
     detail "Would enable RFC1918 SSH password login for '$OPT_USERNAME'"
   fi
 
-  ssh_apply_socket_port
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then
+    # Keep the new port reachable even if the later firewall component fails
+    # or was excluded. Existing rules and the old access path remain intact.
+    if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+      run ufw allow "${OPT_SSH_PORT}/tcp" comment SSH \
+        || die "Could not allow the new SSH port before restarting sshd."
+    fi
+    ssh_apply_socket_port
+  fi
+  if [ "$OPT_DRY_RUN" -eq 0 ]; then
+    local changed=0
+    for i in "${!paths[@]}"; do
+      f="${paths[$i]}"
+      if [ -e "$snapshot/$i" ]; then
+        cmp -s "$snapshot/$i" "$f" || changed=1
+      elif [ -e "$f" ]; then
+        changed=1
+      fi
+    done
+    if [ "$changed" -eq 0 ] && { systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; }; then
+      committed=1
+      detail "SSH configuration unchanged; no restart needed"
+      return 0
+    fi
+  fi
   restarting=1
   ssh_restart
   committed=1
@@ -330,6 +361,13 @@ ssh_validate_local_policy() {
 
 fn_ssh() {
   step "SSH access"
+  if ! have sshd || ! have visudo; then
+    apt_ensure_lists || die "Could not refresh SSH dependency indexes."
+    apt_install "SSH and sudo" openssh-server openssh-client sudo || die "Could not install SSH dependencies."
+  fi
+  if [ -n "$OPT_PUBKEY" ] && [ "$OPT_DRY_RUN" -eq 0 ]; then
+    ssh-keygen -lf /dev/stdin <<<"$OPT_PUBKEY" >&4 2>&1 || die "The supplied public key is invalid."
+  fi
   ssh_create_user
   ssh_setup_keys
   ssh_configure
@@ -343,7 +381,7 @@ fn_ssh() {
     ok "sshd listening on port $OPT_SSH_PORT (system authentication preserved)"
   fi
 
-  if [ "$OPT_SSH_PORT" != "22" ]; then
+  if [ "$OPT_SSH_PORT_SET" -eq 1 ]; then
     warn "SSH now listens on port $OPT_SSH_PORT. Verify a new session works before closing this one."
   fi
 }

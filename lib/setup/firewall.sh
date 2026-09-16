@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: firewall
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: firewall - Configure the UFW firewall
 #
@@ -13,6 +13,25 @@
 
 fn_firewall() {
   step "Firewall (UFW)"
+
+  if [ "$OPT_RESET_FIREWALL" -eq 0 ] && has_container_workloads; then
+    detail "Existing container host detected; preserving its firewall policy"
+    return 0
+  fi
+
+  # An inactive firewall on an already-serving machine is not a fresh install.
+  # Preserve access to panels, game servers and other host services by default.
+  if [ "$OPT_RESET_FIREWALL" -eq 0 ] && have ss; then
+    local listeners port
+    listeners="$(ss -H -lntu 2>/dev/null | awk '{print $5}' || true)"
+    for port in $listeners; do
+      case "$port" in 127.*|\[::1\]:*|::1:*) continue ;; esac
+      port="${port##*:}"
+      case "$port" in 22|80|443|"$OPT_SSH_PORT") continue ;; esac
+      detail "Existing service on port $port detected; preserving firewall policy"
+      return 0
+    done
+  fi
 
   if ! have ufw; then
     apt_ensure_lists || true
@@ -29,12 +48,17 @@ fn_firewall() {
     warn "Existing UFW rules were wiped by --reset-firewall."
   fi
 
-  run_sh "ufw default deny incoming" || die "$ufw_fail"
-  run_sh "ufw default allow outgoing"
+  if ! ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    run_sh "ufw default deny incoming" || die "$ufw_fail"
+    run_sh "ufw default allow outgoing"
+  fi
 
   # Allow SSH before enabling; ufw limit also rate-limits repeat connections.
-  run_sh "ufw limit ${OPT_SSH_PORT}/tcp comment 'SSH'"
-  ok "SSH allowed and rate-limited on ${OPT_SSH_PORT}/tcp"
+  local ssh_port
+  for ssh_port in ${SSH_LISTEN_PORTS:-$OPT_SSH_PORT}; do
+    run ufw allow "${ssh_port}/tcp" comment SSH
+  done
+  ok "Existing SSH listening ports allowed"
 
   if is_enabled dokploy; then
     run_sh "ufw allow 80/tcp comment 'HTTP (Traefik)'"
@@ -46,7 +70,6 @@ fn_firewall() {
       run_sh "ufw allow 3000/tcp comment 'Dokploy UI (--ui-public)'"
       ok "Opened 80/tcp, 443/tcp, 443/udp and 3000/tcp for Dokploy"
     else
-      run_sh "ufw delete allow 3000/tcp" || true
       ok "Opened 80/tcp, 443/tcp and 443/udp for Dokploy"
     fi
   fi

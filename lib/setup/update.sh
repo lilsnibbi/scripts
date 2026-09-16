@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: update
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: update - Refresh apt indexes and apply every pending upgrade
 #
@@ -62,29 +62,21 @@ fn_update() {
   # the prerequisites; a second refresh would only cost time.
   apt_ensure_lists || die "apt-get update failed. Check network and mirror configuration."
 
-  # Ubuntu ships some updates to a percentage of machines at a time and holds
-  # them back everywhere else. On a host being deliberately brought fully up to
-  # date, "not in the rollout cohort yet" is not a useful reason to skip a
-  # package, so opt in to the phased ones too. Inert on Debian, which does not
-  # phase updates at all.
-  local upgrade_opts=("${APT_OPTS[@]}" -o APT::Get::Always-Include-Phased-Updates=true)
+  # Respect distribution phasing and never remove packages from a live host.
+  local upgrade_opts=("${APT_OPTS[@]}" --with-new-pkgs --no-remove)
 
-  # Simulate the command that actually runs. "apt-get upgrade" never installs
-  # or removes a package, so on any host with a pending kernel or a changed
-  # dependency it simulates zero work while dist-upgrade has plenty. Counting
-  # with one and running the other is how this step used to report "already up
-  # to date" and skip the upgrade on precisely the machines that needed it.
+  # Simulate the same resolver options used by the real upgrade.
   local pending
-  pending="$(apt-get -s dist-upgrade "${upgrade_opts[@]}" 2>/dev/null | grep -c '^Inst ' || true)"
+  pending="$(apt-get -s upgrade "${upgrade_opts[@]}" 2>/dev/null | grep -c '^Inst ' || true)"
   if [ "${pending:-0}" -gt 0 ]; then
     detail "$pending package(s) to upgrade"
   fi
 
   # Run it whatever the count says. The simulation is a report, not a gate: it
-  # can still disagree with the real resolver, and a dist-upgrade with nothing
+  # can still disagree with the real resolver, and an upgrade with nothing
   # to do costs about a second.
   run_spin "Upgrading packages (this can take several minutes)" \
-    retry apt-get dist-upgrade "${upgrade_opts[@]}" \
+    retry apt-get upgrade "${upgrade_opts[@]}" \
     || die "Package upgrade failed. See: ${LOG_HINT}"
 
   if [ "${pending:-0}" -gt 0 ]; then
@@ -92,8 +84,6 @@ fn_update() {
   else
     ok "System already up to date"
   fi
-
-  run apt-get autoremove "${APT_OPTS[@]}" || true
 
   if [ -f /var/run/reboot-required ]; then
     warn "A reboot is required to finish applying kernel or library updates."

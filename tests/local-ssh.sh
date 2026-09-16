@@ -7,7 +7,7 @@ if [ "${1:-}" != --isolated ]; then
   exec unshare --mount --propagation private bash "$0" --isolated
 fi
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-source <(sed '$d' "$repo/lib/setup.sh")
+source <(sed '/^main "\$@"$/d' "$repo/lib/setup.sh")
 source "$repo/lib/setup/ssh.sh"
 source "$repo/lib/setup/hardening.sh"
 exec 3>&1 4>/dev/null
@@ -19,6 +19,16 @@ mount --bind "$test_dir/ssh" /etc/ssh
 mount --bind "$test_dir/units" /etc/systemd/system
 mount --bind "$test_dir/run" /run
 mkdir -p /run/sshd
+(
+  exec 8>/run/server-init.lock
+  flock -n 8
+  if output="$(bash "$repo/lib/setup.sh" --only=verify 2>&1)"; then
+    echo 'Concurrent setup unexpectedly succeeded' >&2
+    exit 1
+  fi
+  grep -q 'Another setup run is already active' <<<"$output"
+)
+printf 'PASS: concurrent modifying runs rejected before preflight\n'
 ssh-keygen -q -t ed25519 -N '' -f "$test_dir/ssh/ssh_host_ed25519_key"
 detail() { :; }
 ok() { :; }
@@ -97,6 +107,7 @@ Match User nobody
     X11Forwarding no
 CONF
   LOCAL_ACCESS_ENABLED=1 OPT_DRY_RUN=0 OPT_USERNAME=root OPT_SSH_PORT=2222
+  OPT_SSH_PORT_SET=1
   test_restart_failure=0 test_socket_disabled=1
   : >"$test_dir/systemctl.log"
 }
@@ -127,6 +138,34 @@ ssh_configure
 expect_policy nobody 192.168.1.2 'passwordauthentication no'
 assert test "$(grep -c 'BEGIN setup.sh local SSH' /etc/ssh/sshd_config || true)" = 0
 printf 'PASS: real OpenSSH address/user scope, key access, idempotency and removal\n'
+
+reset_config
+LOCAL_ACCESS_ENABLED=0 OPT_SSH_PORT_SET=0
+sed -i 's/^Port 22$/Port 2200\nPort 2222/' /etc/ssh/sshd_config
+mkdir -p /etc/systemd/system/ssh.socket.d
+printf '[Socket]\nListenStream=\nListenStream=127.0.0.1:2200\n' >/etc/systemd/system/ssh.socket.d/10-port.conf
+cp /etc/systemd/system/ssh.socket.d/10-port.conf "$test_dir/socket-before"
+ssh_configure
+assert grep -qx 'port 2200' < <(policy root 8.8.8.8)
+assert grep -qx 'port 2222' < <(policy root 8.8.8.8)
+assert cmp /etc/systemd/system/ssh.socket.d/10-port.conf "$test_dir/socket-before"
+assert test ! -e /etc/ssh/sshd_config.d/00-server-init.conf
+rm /etc/systemd/system/ssh.socket.d/10-port.conf
+printf 'PASS: default reruns preserve multiple SSH ports and socket bind addresses\n'
+
+SSH_USER_HOME="$test_dir/home" OPT_USERNAME=root
+mkdir -p "$SSH_USER_HOME/.ssh"
+printf '%s' 'ssh-ed25519 existing' >"$SSH_USER_HOME/.ssh/authorized_keys"
+ssh_install_pubkey 'ssh-ed25519 added'
+assert test "$(wc -l <"$SSH_USER_HOME/.ssh/authorized_keys")" = 2
+ssh_install_pubkey 'ssh-ed25519 added'
+assert test "$(wc -l <"$SSH_USER_HOME/.ssh/authorized_keys")" = 2
+mv "$SSH_USER_HOME/.ssh/authorized_keys" "$test_dir/key-target"
+ln -s "$test_dir/key-target" "$SSH_USER_HOME/.ssh/authorized_keys"
+if (ssh_install_pubkey 'ssh-ed25519 refused'); then die 'Symlinked key file accepted'; fi
+assert test "$(wc -l <"$test_dir/key-target")" = 2
+SSH_USER_HOME=''
+printf 'PASS: key append preserves unterminated lines and refuses symlinks\n'
 
 reset_config
 cp -p /etc/ssh/sshd_config "$test_dir/baseline"
@@ -189,6 +228,6 @@ printf 'PASS: dry-run and password preservation\n'
 
 for f in "$repo/lib/setup.sh" "$repo"/lib/setup/*.sh; do bash -n "$f"; done
 for f in "$repo"/lib/setup/*.sh; do verify_module "$(basename "$f" .sh)" "$f"; done
-sed 's/# setup-api: 3/# setup-api: 2/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
+sed 's/# setup-api: 4/# setup-api: 3/' "$repo/lib/setup/ssh.sh" >"$test_dir/stale.sh"
 if (verify_module ssh "$test_dir/stale.sh"); then die 'Stale module API was accepted'; fi
 printf 'PASS: Bash syntax and module API compatibility\n'

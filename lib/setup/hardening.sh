@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: hardening
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: hardening - Kernel network hardening, journald limits, root
 #  password lock
@@ -72,8 +72,12 @@ fs.protected_hardlinks = 1
 CONF
 )"
 
+  if in_container; then
+    conf="$(printf '%s\n' "$conf" | sed '/^kernel\./d; /^fs\./d')"
+  fi
+
   if write_file /etc/sysctl.d/99-server-init-hardening.conf 0644 "$conf"; then
-    if run sysctl --system; then
+    if run sysctl -p /etc/sysctl.d/99-server-init-hardening.conf; then
       ok "Kernel network hardening applied"
     elif in_container; then
       # The net.* keys are per-namespace and take; kernel.* and fs.* belong to
@@ -110,36 +114,10 @@ CONF
   fi
 }
 
-# Disabling root's SSH login leaves its password untouched, so a console, a
-# rescue shell or a serial port is still a password prompt. Only lock it once
-# the replacement account is demonstrably usable, and never when root is the
-# account being configured.
+# Key-file presence cannot prove that a replacement login or sudo works.
+# Preserve console/rescue access; authentication changes belong to the operator.
 lock_root_password() {
-  if local_access_enabled; then
-    detail "Local computer: preserving the root password for console/rescue access"
-    return 0
-  fi
-  if [ "$OPT_USERNAME" = "root" ]; then
-    detail "Root is the login account; leaving its password alone"
-    return 0
-  fi
-
-  resolve_user_home
-  if [ "$(ssh_count_keys)" -lt 1 ]; then
-    detail "'$OPT_USERNAME' has no authorized keys yet; leaving root's password alone"
-    return 0
-  fi
-
-  if [ "$(passwd -S root 2>/dev/null | awk '{print $2}')" = "L" ]; then
-    detail "Root password already locked"
-    return 0
-  fi
-
-  if run passwd -l root; then
-    ok "Root password locked; '$OPT_USERNAME' with sudo is the only way in"
-  else
-    warn "Could not lock the root password."
-  fi
+  detail "Root password preserved for console/rescue access"
 }
 
 # end-of-module

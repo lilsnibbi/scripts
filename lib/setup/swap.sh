@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: swap
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: swap - Create a swapfile when RAM is small and no swap exists
 #
@@ -21,6 +21,11 @@ fn_swap() {
   # and the 2 GB file it would take to find that out is pure waste.
   if in_container; then
     detail "Container detected; swap is allocated by the host"
+    return 0
+  fi
+
+  if [ -e /swapfile ] || [ -L /swapfile ] || grep -qE '^/swapfile[[:space:]]' /etc/fstab; then
+    detail "Existing /swapfile or fstab entry preserved; no swapfile created"
     return 0
   fi
 
@@ -52,8 +57,13 @@ fn_swap() {
     return 0
   fi
 
-  run_spin "Creating a ${size_mb} MB swapfile" \
-    bash -c "fallocate -l ${size_mb}M /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=${size_mb}"
+  (umask 077; set -o noclobber; : >/swapfile) || die "Could not safely create /swapfile."
+  if ! run_spin "Creating a ${size_mb} MB swapfile" \
+    dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none; then
+    run rm -f /swapfile
+    warn "Could not allocate swap; continuing without it."
+    return 0
+  fi
   run chmod 600 /swapfile
 
   # Swap is a convenience, not a dependency. A filesystem that refuses
@@ -67,7 +77,7 @@ fn_swap() {
   grep -qE '^/swapfile\b' /etc/fstab || run_sh "printf '/swapfile none swap sw 0 0\n' >> /etc/fstab"
   if write_file /etc/sysctl.d/99-swap.conf 0644 "vm.swappiness = 10
 vm.vfs_cache_pressure = 50"; then
-    run sysctl --system || warn "Could not apply the swappiness settings."
+    run sysctl -p /etc/sysctl.d/99-swap.conf || warn "Could not apply the swappiness settings."
   fi
 
   ok "${size_mb} MB swapfile active"

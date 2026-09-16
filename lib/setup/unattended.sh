@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-module: unattended
-# setup-api: 3
+# setup-api: 4
 # =============================================================================
 #  Component: unattended - Enable automatic security updates
 #
@@ -28,7 +28,7 @@ fn_unattended() {
   }
 
   local origins
-  if [ "$OS_ID" = "ubuntu" ]; then
+  if [ "$OS_BASE_ID" = "ubuntu" ]; then
     # Origins-Pattern entries must be key=value pairs. The shorter
     # "Ubuntu:noble-security" form belongs to Allowed-Origins, and putting it
     # here makes unattended-upgrade fail to parse its own configuration.
@@ -39,6 +39,8 @@ fn_unattended() {
     origins='        "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";'
   fi
+  # Derivatives can report their own codename to unattended-upgrades.
+  origins="${origins//\$\{distro_codename\}/$OS_CODENAME}"
 
   # Installing a kernel patch does not activate it. Without a reboot the host
   # keeps running the vulnerable image indefinitely, and across a fleet nobody
@@ -73,13 +75,16 @@ $origins
 };
 
 // Upgrading these restarts the Docker daemon under running containers.
-#clear Unattended-Upgrade::Package-Blacklist;
+// Preserve the operator's existing package blacklist as well.
 Unattended-Upgrade::Package-Blacklist {
         "docker-ce";
         "docker-ce-cli";
         "containerd.io";
         "docker-buildx-plugin";
         "docker-compose-plugin";
+        "docker.io";
+        "containerd";
+        "runc";
 };
 
 $reboot_policy
@@ -88,10 +93,10 @@ $reboot_policy
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::InstallOnShutdown "false";
 
-// Stop /boot filling up with old kernels, a common cause of later apt failures.
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
+// Leave package/kernel removal to the operator's maintenance policy.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
 
 // Virtual machines report no AC power.
 Unattended-Upgrade::OnlyOnACPower "false";

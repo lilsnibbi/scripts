@@ -30,7 +30,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.3.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -45,7 +45,8 @@ SETUP_BASE="${SETUP_BASE:-}"
 #
 # 2: added ui_allow_list, which the dokploy module calls.
 # 3: hardware-gated local_access_enabled, shared by SSH, Dokploy and hardening.
-SETUP_API=3
+# 4: atomic fatal-on-error writes, preserved SSH ports and workload detection.
+SETUP_API=4
 
 # -----------------------------------------------------------------------------
 # Non-interactive environment.
@@ -60,8 +61,16 @@ export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 export UCF_FORCE_CONFOLD=1
 
+# Provision this machine even if the invoking shell has a remote Docker context.
+# External installers inherit the same local endpoint.
+export DOCKER_HOST=unix:///var/run/docker.sock
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+
 APT_OPTS=(
   -y
+  -o DPkg::Lock::Timeout=300
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
   -o Dpkg::Options::=--force-confdef
   -o Dpkg::Options::=--force-confold
 )
@@ -71,6 +80,8 @@ APT_OPTS=(
 # -----------------------------------------------------------------------------
 OPT_USERNAME="root"
 OPT_SSH_PORT="22"
+OPT_SSH_PORT_SET=0
+SSH_LISTEN_PORTS=""
 OPT_PUBKEY=""
 OPT_HOSTNAME=""
 # UTC by default rather than whatever the image happens to ship. Timestamps
@@ -98,12 +109,12 @@ OPT_NO_COLOR=0
 # by setup/<name>.sh, which must define fn_<name>.
 # -----------------------------------------------------------------------------
 COMPONENTS=(
-  "update:Refresh apt indexes and apply every pending upgrade"
+  "update:Refresh apt indexes and upgrade without removing packages"
   "base:Install base utilities (curl, git, jq, iproute2, ...)"
   "ssh:Create the login account and set the SSH port"
   "firewall:Configure the UFW firewall"
   "fail2ban:Install and pre-configure fail2ban for SSH"
-  "hardening:Kernel network hardening, journald limits, root password lock"
+  "hardening:Kernel network hardening and journald limits"
   "tuning:Performance tuning: network stack, limits, power, CPU governor"
   "swap:Create a swapfile when RAM is small and no swap exists"
   "docker:Install Docker CE with container log rotation"
@@ -143,6 +154,7 @@ STEP_TITLE=""
 STEP_T0=0
 
 OS_ID=""
+OS_BASE_ID=""
 OS_CODENAME=""
 OS_VERSION_ID=""
 OS_PRETTY=""
@@ -342,6 +354,8 @@ wrap_text() {
   set -f
   local width="$1"; shift
   local line="" word
+  # Deliberately wrap words, rather than retaining argument boundaries.
+  # shellcheck disable=SC2048
   for word in $*; do
     if [ -z "$line" ]; then
       line="$word"
@@ -634,7 +648,7 @@ apt_install() {
 }
 
 apt_update() {
-  run_spin "Refreshing package indexes" retry apt-get update "${APT_OPTS[@]}"
+  run_spin "Refreshing package indexes" retry apt-get update "${APT_OPTS[@]}" -o APT::Update::Error-Mode=any
   local rc=$?
   [ $rc -eq 0 ] && APT_UPDATED=1
   return $rc
@@ -654,7 +668,22 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # LXC (Proxmox CT), Docker, systemd-nspawn and friends. Several things a VM or
 # a physical machine owns - the clock, swap, the CPU governor, power management
 # - belong to the host in a container, and the components skip them there.
-in_container() { systemd-detect-virt --container >/dev/null 2>&1; }
+in_container() {
+  [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -e /run/systemd/container ] \
+    || systemd-detect-virt --container >/dev/null 2>&1
+}
+
+# Existing workloads must not be converted into a fresh Dokploy machine.
+has_container_workloads() {
+  [ -f /etc/pterodactyl/config.yml ] && return 0
+  have docker || return 1
+  local containers swarm
+  # An inaccessible daemon is not evidence of an empty host.
+  containers="$(docker ps -aq 2>/dev/null)" || return 0
+  [ -n "$containers" ] && return 0
+  swarm="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" || return 0
+  [ "$swarm" != inactive ]
+}
 
 # Require affirmative bare-metal detection before trusting chassis information:
 # containers can expose their host's DMI. Missing/failed probes fail closed.
@@ -709,7 +738,9 @@ backup_file() {
 # avoids needless service restarts.
 write_file() {
   local path="$1" mode="$2" content="$3"
-  if [ -f "$path" ] && [ "$(cat "$path")" = "$content" ]; then
+  [ ! -L "$path" ] || die "Refusing to replace symlinked configuration: $path"
+  if [ -f "$path" ] && [ "$(cat "$path")" = "$content" ] \
+      && [ "$(stat -c %a "$path")" = "${mode#0}" ]; then
     log "unchanged: $path"
     return 1
   fi
@@ -718,9 +749,14 @@ write_file() {
     return 0
   fi
   log "writing: $path"
-  mkdir -p "$(dirname "$path")"
-  printf '%s\n' "$content" >"$path"
-  chmod "$mode" "$path"
+  local tmp
+  mkdir -p "$(dirname "$path")" || die "Could not create directory for $path"
+  tmp="$(mktemp "${path}.tmp.XXXXXX")" || die "Could not stage $path"
+  if ! printf '%s\n' "$content" >"$tmp" || ! chmod "$mode" "$tmp" \
+      || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    die "Could not write $path"
+  fi
   return 0
 }
 
@@ -769,7 +805,8 @@ usage() {
   ui "                        A non-root name is created with passwordless sudo."
   ui "                        --local permits LAN passwords for this account."
   ui "   ${C_INFO}--ssh-port=N${NC}         Port for sshd, and the port opened in the firewall."
-  ui "                        Default: ${BOLD}22${NC}. Authentication is preserved unless"
+  ui "                        Default: preserve current ports (22 on fresh images)."
+  ui "                        Authentication is preserved unless"
   ui "                        --local applies on a physical laptop/desktop."
   ui "   ${C_INFO}--pubkey=\"ssh-... \"${NC}  Append this public key to the account's authorized_keys."
   ui "                        Optional. Existing keys are never removed."
@@ -817,8 +854,8 @@ usage() {
   ui "   ${C_INFO}--help${NC}               Show this help and exit."
   ui ""
   ui " ${C_TITLE}${BOLD}Examples${NC}"
-  ui "   ${C_MUTED}curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash -s -- --pubkey=\"\$(cat ~/.ssh/id_ed25519.pub)\"${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --username=deploy --ssh-port=2222 --ui-allow=203.0.113.9/32${NC}"
+  ui "   ${C_MUTED}curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash${NC}"
+  ui "   ${C_MUTED}sudo ./setup.sh --dry-run${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --local${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --exclude=bun,cloudflared${NC}"
   ui "   ${C_MUTED}sudo ./setup.sh --only=ssh,firewall,fail2ban${NC}"
@@ -851,12 +888,17 @@ parse_args() {
   while [ $# -gt 0 ]; do
     arg="$1"
     value="${arg#*=}"
+    if [[ "$arg" = --*= ]]; then
+      setup_colors
+      exec 3>&1
+      die "Option requires a value: ${arg%=}"
+    fi
     case "$arg" in
       --help|-h)             usage ;;
       --list)                list_components ;;
       --version)             echo "$SCRIPT_NAME v$SCRIPT_VERSION"; exit 0 ;;
       --username=*)          OPT_USERNAME="$value" ;;
-      --ssh-port=*)          OPT_SSH_PORT="$value" ;;
+      --ssh-port=*)          OPT_SSH_PORT="$value"; OPT_SSH_PORT_SET=1 ;;
       --pubkey=*)            OPT_PUBKEY="$value" ;;
       --hostname=*)          OPT_HOSTNAME="$value" ;;
       --timezone=*)          OPT_TIMEZONE="$value"; OPT_TIMEZONE_SET=1 ;;
@@ -886,15 +928,22 @@ parse_args() {
 validate_args() {
   local name known entry
 
-  if ! [[ "$OPT_SSH_PORT" =~ ^[0-9]+$ ]] || [ "$OPT_SSH_PORT" -lt 1 ] || [ "$OPT_SSH_PORT" -gt 65535 ]; then
+  if ! [[ "$OPT_SSH_PORT" =~ ^[0-9]{1,5}$ ]] || [ "$((10#$OPT_SSH_PORT))" -lt 1 ] || [ "$((10#$OPT_SSH_PORT))" -gt 65535 ]; then
     die "--ssh-port must be a number between 1 and 65535 (got: $OPT_SSH_PORT)"
+  fi
+  OPT_SSH_PORT="$((10#$OPT_SSH_PORT))"
+
+  if [ -n "$OPT_HOSTNAME" ] && { [ "${#OPT_HOSTNAME}" -gt 253 ] \
+      || ! [[ "$OPT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }; then
+    die "--hostname must be a valid hostname"
   fi
 
   if ! [[ "$OPT_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
     die "--username must be a valid Linux user name (got: $OPT_USERNAME)"
   fi
 
-  if [ -n "$OPT_PUBKEY" ] && ! [[ "$OPT_PUBKEY" =~ ^(ssh-(rsa|ed25519)|ecdsa-sha2-|sk-)[A-Za-z0-9@.-]*[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
+  if [ -n "$OPT_PUBKEY" ] && { [[ "$OPT_PUBKEY" = *$'\n'* || "$OPT_PUBKEY" = *$'\r'* ]] \
+      || ! [[ "$OPT_PUBKEY" =~ ^(ssh-(rsa|ed25519)|ecdsa-sha2-|sk-)[A-Za-z0-9@.-]*[[:space:]]+[A-Za-z0-9+/=]+ ]]; }; then
     die "--pubkey does not look like an OpenSSH public key"
   fi
 
@@ -906,6 +955,7 @@ validate_args() {
   local list
   for list in "$OPT_EXCLUDE" "$OPT_ONLY"; do
     [ -n "$list" ] || continue
+    [[ "$list" =~ ^[a-z][a-z0-9]*(,[a-z][a-z0-9]*)*$ ]] || die "Component lists must be comma-separated names"
     for name in ${list//,/ }; do
       known=0
       for entry in "${COMPONENTS[@]}"; do
@@ -940,11 +990,13 @@ validate_args() {
   # A malformed CIDR would otherwise surface much later, as an iptables error
   # inside the boot-time firewall unit - with port 3000 left open. Fail here.
   if [ -n "$OPT_UI_ALLOW" ]; then
+    [[ "$OPT_UI_ALLOW" =~ ^[0-9./]+(,[0-9./]+)*$ ]] || die "--ui-allow must be comma-separated IPv4 addresses or CIDRs"
     local cidr
     for cidr in ${OPT_UI_ALLOW//,/ }; do
       if ! [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
         die "--ui-allow contains an invalid IPv4 address or CIDR: $cidr"
       fi
+      is_ipv4 "${cidr%/*}" || die "--ui-allow contains an invalid IPv4 address: $cidr"
     done
   fi
 
@@ -1019,7 +1071,9 @@ resolve_base() {
     fi
     [ -n "$SETUP_BASE" ] || SETUP_BASE="$SETUP_BASE_DEFAULT"
   fi
-  SETUP_BASE="${SETUP_BASE%/}"
+  [[ "$SETUP_BASE" =~ ^https?://[^[:space:]]+$ || "$SETUP_BASE" = /* ]] \
+    || die "Module base must be an http(s) URL or absolute directory."
+  [ "$SETUP_BASE" = / ] || SETUP_BASE="${SETUP_BASE%/}"
 }
 
 base_is_local() { [ "${SETUP_BASE#/}" != "$SETUP_BASE" ]; }
@@ -1085,6 +1139,7 @@ detect_os() {
   # shellcheck disable=SC1091
   . /etc/os-release
   OS_ID="${ID:-unknown}"
+  OS_BASE_ID="$OS_ID"
   OS_CODENAME="${VERSION_CODENAME:-}"
   OS_VERSION_ID="${VERSION_ID:-}"
   OS_PRETTY="${PRETTY_NAME:-$OS_ID $OS_VERSION_ID}"
@@ -1098,7 +1153,9 @@ detect_os() {
       case " ${ID_LIKE:-} " in
         *debian*|*ubuntu*)
           warn "Untested distribution '$OS_ID'; continuing because it is Debian-based."
-          [ -n "$OS_CODENAME" ] || OS_CODENAME="${DEBIAN_CODENAME:-}"
+          OS_BASE_ID=debian
+          case " ${ID_LIKE:-} " in *ubuntu*) OS_BASE_ID=ubuntu ;; esac
+          OS_CODENAME="${UBUNTU_CODENAME:-${DEBIAN_CODENAME:-$OS_CODENAME}}"
           ;;
         *)
           die "Only Debian and Ubuntu are supported. Detected: $OS_PRETTY"
@@ -1110,16 +1167,13 @@ detect_os() {
   [ -n "$OS_CODENAME" ] || die "Could not determine the distribution codename (VERSION_CODENAME)."
 }
 
-# Wait for cloud-init and the apt/dpkg locks. On a freshly booted cloud VM the
+# Wait for apt/dpkg locks. On a freshly booted cloud VM the
 # unattended-upgrades and apt-daily timers hold these locks for the first minute
 # or two, and any apt call in that window fails outright.
 wait_for_system_ready() {
-  if have cloud-init; then
-    if cloud-init status >/dev/null 2>&1; then
-      detail "Waiting for cloud-init to finish"
-      run_sh "timeout 300 cloud-init status --wait" || warn "cloud-init did not finish within 300s; continuing anyway."
-    fi
-  fi
+  [ "$OPT_DRY_RUN" -eq 0 ] || return 0
+  # Do not wait for cloud-init itself: setup can be its child (runcmd).
+  # Package locks are the resource we need, regardless of their owner.
 
   local waited=0 timeout=300
   while apt_lock_held; do
@@ -1127,9 +1181,7 @@ wait_for_system_ready() {
       detail "Waiting for another package manager to release the apt lock"
     fi
     if [ $waited -ge $timeout ]; then
-      warn "apt lock still held after ${timeout}s; stopping the apt timers and continuing."
-      run systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service || true
-      break
+      die "Package manager still busy after ${timeout}s. Let it finish before retrying."
     fi
     sleep 5
     waited=$((waited + 5))
@@ -1223,6 +1275,20 @@ preflight() {
   [ "$(id -u)" -eq 0 ] || die "Must run as root:  sudo ./setup.sh"
 
   detect_os
+  if [ "$OPT_DRY_RUN" -eq 0 ] && [ ! -d /run/systemd/system ]; then
+    die "A running systemd instance is required. Run this inside the target VM or systemd CT."
+  fi
+
+  # Load and validate every module before clock/package/configuration changes.
+  load_modules "${TO_RUN[@]}"
+  if [ "$OPT_SSH_PORT_SET" -eq 0 ] && have sshd; then
+    local ports
+    ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true)"
+    if [ -n "$ports" ]; then
+      SSH_LISTEN_PORTS="$ports"
+      OPT_SSH_PORT="${ports%%$'\n'*}"
+    fi
+  fi
 
   case "$ARCH" in
     amd64|arm64|x86_64|aarch64) ;;
@@ -1248,9 +1314,7 @@ preflight() {
   wait_for_system_ready
   ensure_clock
 
-  # Read-only, so a wrong URL or a stale module aborts with the machine
-  # untouched. Then the prerequisites, ahead of every component.
-  load_modules "${TO_RUN[@]}"
+  # Prerequisites precede every component, including partial runs.
   bootstrap_packages
 }
 
@@ -1289,9 +1353,15 @@ banner() {
 # =============================================================================
 version_of() {
   local cmd="$1"
+  local output
   have "$cmd" || { printf '%s' "not installed"; return 0; }
   case "$cmd" in
-    docker)      docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || true ;;
+    docker)
+      if output="$(docker --version 2>/dev/null)"; then
+        printf '%s\n' "$output" | awk '{print $3}' | tr -d ','
+      else
+        printf unavailable
+      fi ;;
     cloudflared) cloudflared --version 2>/dev/null | awk '{print $3}' || true ;;
     fail2ban-client) fail2ban-client --version 2>/dev/null | awk '{print $2}' || true ;;
     *)           printf 'installed' ;;
@@ -1335,6 +1405,7 @@ summary() {
   # log answers "did anything go sideways?" before anyone scrolls.
   local bar barcol="$C_OK"
   bar="Setup complete in $(fmt_secs "$elapsed")"
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then bar="Preview complete in $(fmt_secs "$elapsed")"; fi
   if [ "$nwarn" -gt 0 ]; then
     bar="${bar} — ${nwarn} warning${plural}"
     barcol="$C_WARN"
@@ -1407,11 +1478,19 @@ summary() {
 # through, and does not put a six-figure monthly load on somebody else's free
 # endpoint. Falls back to the source address of the default route, which is
 # right on bare metal and on anything not behind NAT.
-is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local octet
+  local -a octets
+  IFS=. read -r -a octets <<<"$1"
+  for octet in "${octets[@]}"; do
+    [[ "$octet" = 0 || "$octet" != 0* ]] && [ "$((10#$octet))" -le 255 ] || return 1
+  done
+}
 
 meta_get() {
   local out
-  out="$(curl -4fsS --connect-timeout 1 --max-time 2 "$@" 2>/dev/null | tr -d '[:space:]' || true)"
+  out="$(curl -4fsS --noproxy '*' --connect-timeout 1 --max-time 2 "$@" 2>/dev/null | tr -d '[:space:]' || true)"
   is_ipv4 "$out" && printf '%s' "$out"
   return 0
 }
@@ -1421,7 +1500,7 @@ detect_public_ip() {
 
   # AWS. IMDSv2 requires a token; instances configured for it reject IMDSv1
   # outright, so ask for one first and fall through when there is no IMDS.
-  token="$(curl -4fsS --connect-timeout 1 --max-time 2 -X PUT \
+  token="$(curl -4fsS --noproxy '*' --connect-timeout 1 --max-time 2 -X PUT \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
     http://169.254.169.254/latest/api/token 2>/dev/null || true)"
   if [ -n "$token" ]; then
@@ -1493,10 +1572,9 @@ open_log() {
     exec 4> >(exec systemd-cat -t "$LOG_TAG" -p info)
     LOG_READY=1
   else
-    # No journal on this system. Command output has nowhere useful to go;
-    # --verbose puts each action on the console instead.
-    exec 4>/dev/null
-    LOG_HINT="unavailable (no systemd journal); re-run with --verbose"
+    # Preserve diagnostics when journald is unavailable.
+    exec 4>&2
+    LOG_HINT="standard error (no systemd journal)"
   fi
 }
 
@@ -1509,6 +1587,14 @@ main() {
 
   validate_args
   resolve_base
+  if [ "$OPT_DRY_RUN" -eq 0 ]; then
+    [ "$(id -u)" -eq 0 ] || die "Must run as root."
+    have flock || die "flock (util-linux) is required to prevent concurrent setup runs."
+    # /run is root-owned; /run/lock can be world-writable on Debian systems.
+    [ ! -L /run/server-init.lock ] || die "Refusing a symlinked setup lock."
+    exec 9>/run/server-init.lock
+    flock -n 9 || die "Another setup run is already active."
+  fi
   open_log
   log "$SCRIPT_NAME v$SCRIPT_VERSION starting; args: $*"
 
