@@ -19,7 +19,7 @@
 #  Exec in and run the script by hand:
 #    docker exec -it init-test bash
 #    cd /opt/init-scripts && lib/setup.sh --dry-run
-#    lib/setup.sh --exclude=dokploy
+#    lib/setup.sh --skip=dokploy
 #
 #  Reset to a clean machine between attempts:
 #    docker rm -f init-test && docker run -d ... (as above)

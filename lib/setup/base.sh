@@ -23,10 +23,11 @@ fn_base() {
     ca-certificates curl wget gnupg lsb-release apt-transport-https
     git unzip tar jq
     iproute2 net-tools dnsutils psmisc
-    openssh-server openssh-client
-    sudo ufw
+    sudo
     htop rsync
   )
+  if is_enabled ssh; then pkgs+=(openssh-server openssh-client); fi
+  if is_enabled firewall; then pkgs+=(ufw); fi
 
   apt_install "base packages (${#pkgs[@]})" "${pkgs[@]}" || die "Failed to install base packages. See: ${LOG_HINT}"
   ok "Base packages installed"

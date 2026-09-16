@@ -30,7 +30,7 @@ set -Eeuo pipefail
 # the sbin directories on PATH. sshd, ufw, sysctl and swapon all live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.4.0"
 SCRIPT_NAME="Server Initialization Suite"
 
 # Where the component modules come from; setup/<name>.sh is appended. In
@@ -92,6 +92,7 @@ OPT_TIMEZONE_SET=0
 OPT_UI_ALLOW=""
 OPT_UI_PUBLIC=0
 OPT_UI_LOCAL=0
+OPT_UI_TUNNEL=0
 LOCAL_ACCESS_ENABLED=0
 OPT_AUTO_REBOOT=""
 OPT_EXCLUDE=""
@@ -719,9 +720,9 @@ resolve_local_access() {
   [ "$OPT_UI_LOCAL" -eq 1 ] || return 0
   if is_local_computer; then
     LOCAL_ACCESS_ENABLED=1
-    detail "--local enabled for this physical laptop/desktop"
+    detail "Local access enabled for this physical laptop/desktop"
   else
-    warn "--local ignored: this is not a confirmed physical laptop/desktop. Use --ui-allow for server/VM/CT Dokploy access."
+    warn "Local access ignored: this is not a confirmed physical laptop/desktop. Use --ui=CIDR for server/VM/CT Dokploy access."
   fi
 }
 
@@ -794,71 +795,24 @@ usage() {
   setup_colors
   exec 3>&1
   ui ""
-  ui " ${C_STEP}${BOLD}${SCRIPT_NAME}${NC} ${C_MUTED}v${SCRIPT_VERSION}${NC}"
-  ui " ${C_RULE}${RULE}${NC}"
+  ui " ${C_TITLE}${BOLD}${SCRIPT_NAME}${NC} v${SCRIPT_VERSION}"
+  ui " Usage: sudo bash setup.sh [options]"
+  ui " No options needed for the default setup."
   ui ""
-  ui " ${C_TITLE}${BOLD}Usage:${NC} curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash -s -- [options]"
-  ui "        sudo ./setup.sh [options]"
+  ui "   --skip=a,b       Skip components; --list shows every available name."
+  ui "   --list           List skippable components and exit."
+  ui "   --dry-run        Preview without applying changes."
+  ui "   --username=NAME  Login account (default: root)."
+  ui "   --pubkey=KEY     Append an SSH public key."
+  ui "   --ssh-port=N     Change SSH port (default: preserve existing ports)."
+  ui "   --ui=ACCESS      Dokploy access: tunnel (default), CIDR[,CIDR], public, local."
+  ui "                    local also permits LAN SSH passwords on desktops/laptops;"
+  ui "                    ignored on servers/VMs/CTs. public exposes first-admin setup."
+  ui "   --help           Show this help."
+  ui "   --version        Show version."
   ui ""
-  ui " ${C_TITLE}${BOLD}Account and SSH${NC}"
-  ui "   ${C_INFO}--username=NAME${NC}      Login account to configure. Default: ${BOLD}root${NC}."
-  ui "                        A non-root name is created with passwordless sudo."
-  ui "                        --local permits LAN passwords for this account."
-  ui "   ${C_INFO}--ssh-port=N${NC}         Port for sshd, and the port opened in the firewall."
-  ui "                        Default: preserve current ports (22 on fresh images)."
-  ui "                        Authentication is preserved unless"
-  ui "                        --local applies on a physical laptop/desktop."
-  ui "   ${C_INFO}--pubkey=\"ssh-... \"${NC}  Append this public key to the account's authorized_keys."
-  ui "                        Optional. Existing keys are never removed."
-  ui ""
-  ui " ${C_TITLE}${BOLD}System${NC}"
-  ui "   ${C_INFO}--hostname=NAME${NC}      Set the system hostname."
-  ui "   ${C_INFO}--timezone=ZONE${NC}      Set the timezone. Default: ${BOLD}UTC${NC}, so timestamps"
-  ui "                        from a fleet are comparable. Use ${BOLD}keep${NC} to leave the"
-  ui "                        image's own setting alone."
-  ui "   ${C_INFO}--ui-allow=CIDR${NC}      Allow these sources (comma separated) to reach the"
-  ui "                        Dokploy UI on port 3000. Without it the port is"
-  ui "                        closed to the network and reachable only over an"
-  ui "                        SSH or Cloudflare tunnel."
-  ui "   ${C_INFO}--local${NC}              Allow the private ranges (10/8, 172.16/12,"
-  ui "                        192.168/16) to reach the Dokploy UI on port 3000."
-  ui "                        Also permit LAN SSH passwords for --username."
-  ui "                        Physical laptops/desktops only; ignored on servers,"
-  ui "                        VMs, containers or unknown hardware. Adds to --ui-allow."
-  ui "   ${C_INFO}--ui-public${NC}          Expose the Dokploy UI to the whole internet."
-  ui "                        ${C_WARN}The first visitor to reach it becomes the admin.${NC}"
-  ui "   ${C_INFO}--auto-reboot=HH:MM${NC}  Let unattended-upgrades reboot in this window when a"
-  ui "                        patch needs it. Default: never reboot on its own,"
-  ui "                        which means kernel patches stay inactive."
-  ui "   ${C_INFO}--remove-snapd${NC}       Purge snapd and hold the package (Ubuntu). Off by"
-  ui "                        default; a Docker host does not need it, but removing"
-  ui "                        a package manager should be asked for, not assumed."
-  ui "   ${C_INFO}--reset-firewall${NC}     Wipe existing UFW rules before applying the baseline."
-  ui "   ${C_INFO}--reinstall-dokploy${NC}  Reinstall Dokploy even if it is already present."
-  ui "                        ${C_WARN}Destructive: leaves and re-initialises Docker Swarm.${NC}"
-  ui ""
-  ui " ${C_TITLE}${BOLD}Selection${NC}"
-  ui "   ${C_INFO}--exclude=a,b${NC}        Skip these components."
-  ui "   ${C_INFO}--only=a,b${NC}           Run only these components."
-  ui "   ${C_INFO}--list${NC}               List components and exit."
-  ui ""
-  ui " ${C_TITLE}${BOLD}Behaviour${NC}"
-  ui "   ${C_INFO}--base=URL${NC}           Fetch component modules from URL/setup/<name>.sh."
-  ui "                        Also accepts an absolute directory. Default:"
-  ui "                        ${SETUP_BASE_DEFAULT}, or the setup/"
-  ui "                        directory beside the script when run from a checkout."
-  ui "   ${C_INFO}--dry-run${NC}            Show what would happen, change nothing."
-  ui "   ${C_INFO}--verbose${NC}            Disable the spinner, print each action as a line."
-  ui "   ${C_INFO}--no-color${NC}           Disable coloured output."
-  ui "   ${C_INFO}--version${NC}            Print the script version and exit."
-  ui "   ${C_INFO}--help${NC}               Show this help and exit."
-  ui ""
-  ui " ${C_TITLE}${BOLD}Examples${NC}"
-  ui "   ${C_MUTED}curl -fsSL ${SETUP_BASE_DEFAULT}/setup.sh | sudo bash${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --dry-run${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --local${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --exclude=bun,cloudflared${NC}"
-  ui "   ${C_MUTED}sudo ./setup.sh --only=ssh,firewall,fail2ban${NC}"
+  ui " Example: sudo bash setup.sh --skip=docker,ssh,fail2ban"
+  ui " Older options remain accepted for existing automation."
   ui ""
   exit 0
 }
@@ -867,7 +821,7 @@ list_components() {
   setup_colors
   exec 3>&1
   ui ""
-  ui " ${C_TITLE}${BOLD}Available components${NC}"
+  ui " ${C_TITLE}${BOLD}Skippable components${NC}"
   ui " ${C_RULE}${RULE}${NC}"
   local entry name desc
   for entry in "${COMPONENTS[@]}"; do
@@ -876,12 +830,16 @@ list_components() {
     printf '   %b%-13s%b %s\n' "$BOLD" "$name" "$NC" "$desc" >&3
   done
   ui ""
+  ui " Usage: --skip=docker,ssh,fail2ban"
+  ui " Shared prerequisites (curl, unzip, CA certificates) are always required."
+  ui " Skipping docker skips its setup; Dokploy still needs an existing Docker."
+  ui ""
   exit 0
 }
 
 # -----------------------------------------------------------------------------
-# Argument parsing. Unknown flags are a hard error: silently ignoring a typo in
-# --exclude is how the previous version quietly did the wrong thing.
+# Argument parsing. Unknown flags are a hard error: a typo in --skip must not
+# quietly enable a component the caller meant to skip.
 # -----------------------------------------------------------------------------
 parse_args() {
   local arg value
@@ -902,11 +860,21 @@ parse_args() {
       --pubkey=*)            OPT_PUBKEY="$value" ;;
       --hostname=*)          OPT_HOSTNAME="$value" ;;
       --timezone=*)          OPT_TIMEZONE="$value"; OPT_TIMEZONE_SET=1 ;;
+      --ui=*)
+        # Reject contradictory access requests instead of silently broadening
+        # access based on argument order. Legacy aliases share the same state.
+        case "$value" in
+          tunnel) OPT_UI_TUNNEL=1 ;;
+          public) OPT_UI_PUBLIC=1 ;;
+          local) OPT_UI_LOCAL=1 ;;
+          *) OPT_UI_ALLOW="${OPT_UI_ALLOW:+$OPT_UI_ALLOW,}$value" ;;
+        esac
+        ;;
       --ui-allow=*)          OPT_UI_ALLOW="$value" ;;
       --ui-public)           OPT_UI_PUBLIC=1 ;;
       --local)               OPT_UI_LOCAL=1 ;;
       --auto-reboot=*)       OPT_AUTO_REBOOT="$value" ;;
-      --exclude=*)           OPT_EXCLUDE="$value" ;;
+      --skip=*|--exclude=*)  OPT_EXCLUDE="${OPT_EXCLUDE:+$OPT_EXCLUDE,}$value" ;;
       --only=*)              OPT_ONLY="$value" ;;
       --base=*)              OPT_BASE="$value" ;;
       --reset-firewall)      OPT_RESET_FIREWALL=1 ;;
@@ -948,10 +916,10 @@ validate_args() {
   fi
 
   if [ -n "$OPT_EXCLUDE" ] && [ -n "$OPT_ONLY" ]; then
-    die "--exclude and --only cannot be combined"
+    die "--skip/--exclude and --only cannot be combined"
   fi
 
-  # Reject unknown component names in --exclude / --only.
+  # Reject unknown component names in --skip / legacy selection options.
   local list
   for list in "$OPT_EXCLUDE" "$OPT_ONLY"; do
     [ -n "$list" ] || continue
@@ -978,25 +946,29 @@ validate_args() {
   fi
 
   if [ -n "$OPT_UI_ALLOW" ] && [ "$OPT_UI_PUBLIC" -eq 1 ]; then
-    die "--ui-allow and --ui-public cannot be combined"
+    die "Public UI access cannot be combined with an allowlist"
   fi
 
   # --local narrows, --ui-public opens to everything: asking for both is asking
   # for two different answers. --local with --ui-allow is fine and adds up.
   if [ "$OPT_UI_LOCAL" -eq 1 ] && [ "$OPT_UI_PUBLIC" -eq 1 ]; then
-    die "--local and --ui-public cannot be combined"
+    die "Local and public UI access cannot be combined"
+  fi
+
+  if [ "$OPT_UI_TUNNEL" -eq 1 ] && { [ -n "$OPT_UI_ALLOW" ] || [ "$OPT_UI_PUBLIC" -eq 1 ] || [ "$OPT_UI_LOCAL" -eq 1 ]; }; then
+    die "Tunnel-only UI access cannot be combined with network access"
   fi
 
   # A malformed CIDR would otherwise surface much later, as an iptables error
   # inside the boot-time firewall unit - with port 3000 left open. Fail here.
   if [ -n "$OPT_UI_ALLOW" ]; then
-    [[ "$OPT_UI_ALLOW" =~ ^[0-9./]+(,[0-9./]+)*$ ]] || die "--ui-allow must be comma-separated IPv4 addresses or CIDRs"
+    [[ "$OPT_UI_ALLOW" =~ ^[0-9./]+(,[0-9./]+)*$ ]] || die "--ui must be tunnel, local, public, or comma-separated IPv4 addresses/CIDRs"
     local cidr
     for cidr in ${OPT_UI_ALLOW//,/ }; do
       if ! [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
-        die "--ui-allow contains an invalid IPv4 address or CIDR: $cidr"
+        die "UI allowlist contains an invalid IPv4 address or CIDR: $cidr"
       fi
-      is_ipv4 "${cidr%/*}" || die "--ui-allow contains an invalid IPv4 address: $cidr"
+      is_ipv4 "${cidr%/*}" || die "UI allowlist contains an invalid IPv4 address: $cidr"
     done
   fi
 

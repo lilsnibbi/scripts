@@ -43,7 +43,7 @@ fn_dokploy() {
       detail "Would install Dokploy once Docker is present"
       return 0
     fi
-    warn "Docker is not installed, so Dokploy cannot be installed. Re-run without --exclude=docker."
+    warn "Docker is not installed, so Dokploy is skipped. Re-run without skipping docker to install both."
     return 0
   fi
 
@@ -78,7 +78,7 @@ fn_dokploy() {
   fi
 
   if ! dokploy_check_ports; then
-    warn "Skipping Dokploy because required ports are occupied. Free 80, 443 and 3000, then re-run with --only=dokploy."
+    warn "Skipping Dokploy because required ports are occupied. Free 80, 443 and 3000 before re-running."
     return 0
   fi
 

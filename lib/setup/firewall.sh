@@ -41,7 +41,7 @@ fn_firewall() {
   # The first ufw call is where a kernel that cannot load iptables - some
   # unprivileged containers - shows up. Say what to do rather than tracing a
   # bare exit code.
-  local ufw_fail="UFW could not apply its rules. If a host firewall guards this machine (a Proxmox container, say), re-run with --exclude=firewall. See: ${LOG_HINT}"
+  local ufw_fail="UFW could not apply its rules. If a host firewall guards this machine (a Proxmox container, say), re-run with --skip=firewall. See: ${LOG_HINT}"
 
   if [ "$OPT_RESET_FIREWALL" -eq 1 ]; then
     run_sh "ufw --force reset" || die "$ufw_fail"

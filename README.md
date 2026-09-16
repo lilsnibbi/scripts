@@ -10,6 +10,18 @@ curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash
 From a checkout: `sudo bash lib/setup.sh`. Preview with `--dry-run`.
 Logs: `journalctl -t server-init`, or standard error without journald.
 
+List everything you can skip:
+
+```bash
+curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | bash -s -- --list
+```
+
+Skip selected components:
+
+```bash
+curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- --skip=docker,ssh,fail2ban
+```
+
 ## Defaults
 
 - Preserve existing SSH authentication, listening ports, keys and root password.
@@ -44,40 +56,33 @@ ssh -L 3000:localhost:3000 root@server
 
 Then visit `http://localhost:3000`. Use your existing SSH port/account if different.
 
-`--ui-allow=203.0.113.9/32` permits a selected IPv4 source; comma-separated CIDRs
-are accepted. Restricted mode blocks external IPv6. `--ui-public` opens the UI
+`--ui=203.0.113.9/32` permits a selected IPv4 source; comma-separated CIDRs
+are accepted. Restricted mode blocks external IPv6. `--ui=public` opens the UI
 publicly; the first visitor creates the administrator. Rerunning the Dokploy
 component updates these rules in either direction.
 
-`--local` is for **confirmed physical desktops/laptops**. It permits RFC1918
+`--ui=local` is for **confirmed physical desktops/laptops**. It permits RFC1918
 sources (`10/8`, `172.16/12`, `192.168/16`) to reach Dokploy and use the selected
 account's existing SSH password. Servers, VMs, CTs and unknown hardware ignore it.
-No password is created or unlocked. Use `--ui-allow` on servers.
+No password is created or unlocked. Use `--ui=CIDR` on servers.
 
 ## Options
 
-Use only the settings you need. No new flags are required for safe reruns.
+The main CLI has nine options. Defaults handle everything else.
 
 | Option | Purpose |
 | :--- | :--- |
-| `--username=NAME` | Configure an account; create it with passwordless sudo if missing. Default `root`. |
-| `--pubkey="ssh-..."` | Validate and append one public key. |
-| `--ssh-port=N` | Explicitly change the SSH port; allow it in active UFW before restarting SSH. |
-| `--hostname=NAME` | Set a validated hostname. |
-| `--timezone=ZONE` | Default `UTC`; `keep` preserves the current setting. |
-| `--ui-allow=CIDR[,CIDR]` | Permit selected IPv4 sources to reach Dokploy. |
-| `--local` | Desktop/laptop LAN convenience described above. |
-| `--ui-public` | Public Dokploy UI. Conflicts with `--ui-allow` and `--local`. |
-| `--only=a,b` / `--exclude=a,b` | Select or skip components. Mutually exclusive. |
-| `--auto-reboot=HH:MM` | Permit unattended-upgrades to reboot at this time when required. |
-| `--remove-snapd` | Explicitly remove snapd and installed snaps. |
-| `--reset-firewall` | Explicitly discard UFW rules and apply the baseline. |
-| `--reinstall-dokploy` | Destructive reinstall, including Swarm reinitialisation. |
-| `--base=URL` | Module source; also accepts an absolute local directory. |
+| `--skip=a,b` | Skip any components listed by `--list`. Repeated lists combine. |
+| `--list` | List every skippable component and exit without changing the host. |
 | `--dry-run` | Preview without applying provisioning commands. |
-| `--verbose` | Plain progress instead of the spinner. |
-| `--no-color` | Disable colours; automatic when redirected or `NO_COLOR` is set. |
-| `--list`, `--version`, `--help` | Inspect components, version or usage. |
+| `--username=NAME` | Login account; default `root`. New accounts receive passwordless sudo. |
+| `--pubkey="ssh-..."` | Validate and append a public key. |
+| `--ssh-port=N` | Change the SSH port; otherwise preserve existing ports. |
+| `--ui=ACCESS` | `tunnel` (default), IPv4 CIDRs, `public`, or `local`. |
+| `--help` | Show compact usage. |
+| `--version` | Show version. |
+
+Older flags remain accepted for existing automation; see [compatibility](INFO.md#cli-compatibility).
 
 A new non-root account needs a supplied key or a separately set password before
 login. After an explicit port change, verify a new SSH session before disconnecting;
@@ -88,6 +93,10 @@ provider firewalls must also permit it. Local checks cannot prove remote access.
 Execution order: `update`, `base`, `ssh`, `firewall`, `fail2ban`, `hardening`,
 `tuning`, `swap`, `docker`, `dokploy`, `cloudflared`, `bun`, `unattended`, `verify`.
 Use `--list` for their descriptions.
+
+Skipping `ssh` or `firewall` also omits OpenSSH or UFW from the base package
+installation. Skipping `docker` leaves an existing Docker alone; Dokploy needs
+Docker already installed or its step is skipped too.
 
 Prerequisites (`curl`, `unzip`, CA certificates) precede components, including
 partial runs. CTs need systemd; nested Docker requires host-side permissions such
@@ -101,7 +110,7 @@ flow. Optional kernel settings are applied only where supported.
 `https://lilsnibbi.dev/scripts`. The publisher must serve both `setup.sh` and
 `setup/<component>.sh` from the same revision.
 
-Version 3.3 uses **module API 4**. Publish framework/modules together; older
+Version 3.4 uses **module API 4**. Publish framework/modules together; older
 modules are rejected. Name/API/end markers and Bash syntax detect stale or
 truncated files, not malicious code. Module sources execute as root and must be trusted.
 

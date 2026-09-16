@@ -25,7 +25,61 @@ for value in 999.1.1.1 256.1.1.1 01.2.3.4 1.2.3.4/33 '1.2.3.4,' ',1.2.3.4'; do
   reject bash "$repo/lib/setup.sh" --dry-run --ui-allow="$value"
 done
 for value in ',' 'ssh,,base' '*'; do reject bash "$repo/lib/setup.sh" --dry-run --only="$value"; done
-for option in --only= --exclude= --base= --pubkey=; do reject bash "$repo/lib/setup.sh" --dry-run "$option"; done
+for option in --skip= --ui= --only= --exclude= --base= --pubkey=; do reject bash "$repo/lib/setup.sh" --dry-run "$option"; done
+for value in ',' 'ssh,,base' '*' 'dockre'; do reject bash "$repo/lib/setup.sh" --dry-run --skip="$value"; done
+reject bash "$repo/lib/setup.sh" --dry-run --skip=docker --only=ssh
+for args in 'public tunnel' 'public local' 'public 192.168.1.0/24' 'tunnel 192.168.1.0/24'; do
+  read -r first second <<<"$args"
+  reject bash "$repo/lib/setup.sh" --dry-run "--ui=$first" "--ui=$second"
+  reject bash "$repo/lib/setup.sh" --dry-run "--ui=$second" "--ui=$first"
+done
+reject bash "$repo/lib/setup.sh" --dry-run --ui=public --local
+reject bash "$repo/lib/setup.sh" --dry-run --ui=tunnel --ui-allow=192.168.1.0/24
+reject bash "$repo/lib/setup.sh" --dry-run --ui=invalid
+(
+  parse_args --skip=docker,ssh --skip=fail2ban --exclude=bun --ui=tunnel
+  validate_args
+  plan_components
+  assert test "${#SKIPPED[@]}" = 4
+  assert test "${#TO_RUN[@]}" = 10
+  for name in docker ssh fail2ban bun; do reject is_enabled "$name"; done
+  assert is_enabled verify
+)
+for mode in tunnel local public 192.168.1.0/24; do
+  (
+    parse_args "--ui=$mode"
+    validate_args
+    case "$mode" in
+      tunnel) assert test "$OPT_UI_TUNNEL" = 1 ;;
+      local) assert test "$OPT_UI_LOCAL" = 1 ;;
+      public) assert test "$OPT_UI_PUBLIC" = 1 ;;
+      *) assert test "$OPT_UI_ALLOW" = "$mode" ;;
+    esac
+  )
+done
+bash "$repo/lib/setup.sh" --list >"$test_dir/list"
+for entry in "${COMPONENTS[@]}"; do
+  assert grep -qE "^[[:space:]]+${entry%%:*}[[:space:]]" "$test_dir/list"
+done
+assert grep -q -- '--skip=docker,ssh,fail2ban' "$test_dir/list"
+bash "$repo/lib/setup.sh" --help >"$test_dir/help"
+assert test "$(grep -c '^   --' "$test_dir/help")" = 9
+echo 'PASS: compact help, complete component list, combined skips, UI modes and conflict rejection'
+
+(
+  source "$repo/lib/setup/base.sh"
+  step() { :; }
+  apt_ensure_lists() { :; }
+  apt_install() { shift; printf '%s\n' "$@" >"$test_dir/base-packages"; }
+  parse_args --skip=ssh,firewall
+  fn_base
+  if grep -qE '^(openssh-server|openssh-client|ufw)$' "$test_dir/base-packages"; then exit 1; fi
+  assert grep -qx curl "$test_dir/base-packages"
+  OPT_EXCLUDE=''
+  fn_base
+  for package in openssh-server openssh-client ufw; do assert grep -qx "$package" "$test_dir/base-packages"; done
+)
+echo 'PASS: skipped SSH/UFW packages stay out of base installation; defaults retain them'
 OPT_HOSTNAME=valid-host.example OPT_UI_ALLOW=192.168.1.0/24 OPT_SSH_PORT=00022
 validate_args
 assert test "$OPT_SSH_PORT" = 22

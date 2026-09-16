@@ -2,6 +2,20 @@
 
 User commands and defaults: [README.md](README.md).
 
+## CLI compatibility
+
+The primary CLI uses `--skip` for selection and `--ui=tunnel|local|public|CIDR`
+for access. Old fleet commands still work:
+
+- `--exclude` aliases `--skip`; `--only` remains available for targeted runs.
+- `--local`, `--ui-public` and `--ui-allow` retain their original meanings.
+- Existing hostname/timezone, auto-reboot, snapd removal, firewall reset,
+  Dokploy reinstall, module base, verbose and colour options remain supported.
+
+Conflicting UI modes and mixed skip/only selection are rejected. `--ui=local`
+uses the same desktop/laptop hardware gate and scoped SSH policy as `--local`.
+Repeated skip lists combine so a later argument cannot silently re-enable a step.
+
 ## Checks
 
 Run on Linux:
