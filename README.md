@@ -29,6 +29,21 @@ Skip selected components:
 curl -fsSL https://lilsnibbi.dev/scripts/setup.sh | sudo bash -s -- --skip=docker,ssh,fail2ban
 ```
 
+## Homelab laptop power settings
+
+For an Ubuntu Server laptop, the standalone power script disables lid/idle sleep,
+masks suspend/hibernate targets, sets supported CPU governors to `performance`,
+and disables Wi-Fi power saving on `wlp0s20f3` immediately and at boot:
+
+```bash
+curl -fsSL https://lilsnibbi.dev/scripts/homelab-power.sh | sudo bash
+```
+
+Requires systemd, udev and the Ubuntu `iw` package. Reboot to apply lid/idle
+settings. Missing CPU governors/interfaces are reported; other power managers
+can override these settings. Reversal instructions are in the script header.
+This standalone script does not run the server initialization suite.
+
 ## Defaults
 
 - Preserve existing SSH authentication, listening ports, keys and root password.
